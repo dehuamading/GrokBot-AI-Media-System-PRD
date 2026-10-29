@@ -1,0 +1,111 @@
+{
+  "_comment": "（假数据样例）任务03单元测试/CI dry-run 用。所有条目为人工虚构，URL 域名使用 example.com/example.org，不代表真实新闻，绝不用作真实选题。真实抓取数据只存本地 data/raw/（已 gitignore），不入公开库。",
+  "schemaVersion": 1,
+  "query": {"mode": "selected", "window": "7d"},
+  "items": [
+    {
+      "id": "fake-001",
+      "title": "ExampleDoc 上线 AI 表格提取功能：免费用户也能用",
+      "originalTitle": null,
+      "summary": "虚构公司 ExampleDoc 宣布上线 AI 表格提取功能，上传 PDF 即可把表格导出为电子表格，免费档每月 50 页，付费档 2000 页。（假数据，仅用于测试）",
+      "source": {"name": "ExampleDoc：官方博客（RSS）"},
+      "links": {"aihot": "https://aihot.news/items/fake-001", "original": "https://example.com/blog/table-extract?utm_source=rss"},
+      "publishedAt": "2026-10-29T09:00:00.000Z",
+      "category": "ai-products",
+      "score": 80,
+      "selected": true,
+      "reason": "（假数据）官方发布含定价与额度，可验证。"
+    },
+    {
+      "id": "fake-002",
+      "title": "手把手教程：用开源工具 LocalFlow 在本地跑文档问答",
+      "originalTitle": "How to run LocalFlow locally",
+      "summary": "虚构教程演示如何用开源工具 LocalFlow 在自己电脑上搭建文档问答流程：三步安装、无需编程，支持中文 PDF。（假数据，仅用于测试）",
+      "source": {"name": "ExampleWork：专栏（RSS）"},
+      "links": {"aihot": "https://aihot.news/items/fake-002", "original": "https://example.org/tutorial/localflow-guide"},
+      "publishedAt": "2026-10-28T14:30:00.000Z",
+      "category": "tip",
+      "score": 76,
+      "selected": true,
+      "reason": "（假数据）教程含步骤，普通人可复现。"
+    },
+    {
+      "id": "fake-003",
+      "title": "研究：1285 条 AI 引用统计中四成无法溯源",
+      "originalTitle": "Fake study on AI citations",
+      "summary": "虚构研究团队向五个 AI 助手提出 200 个问题，追踪 1285 条统计引用，发现 40% 无法溯源。（假数据，仅用于测试）",
+      "source": {"name": "Example Lab：Research（RSS）"},
+      "links": {"aihot": "https://aihot.news/items/fake-003", "original": "https://example.org/research/citations"},
+      "publishedAt": "2026-10-27T08:00:00.000Z",
+      "category": "paper",
+      "score": 72,
+      "selected": true,
+      "reason": "（假数据）研究类。"
+    },
+    {
+      "id": "fake-004",
+      "title": "虚构巨头 ExampleAI 提交招股书：营收翻倍但亏损扩大",
+      "originalTitle": "ExampleAI IPO filing",
+      "summary": "虚构公司 ExampleAI 提交 S-1 招股书，上半年营收同比增长 14 倍，同时承诺未来五年采购算力 8500 亿美元。（假数据，仅用于测试）",
+      "source": {"name": "Example Wire：AI News（RSS）"},
+      "links": {"aihot": "https://aihot.news/items/fake-004", "original": "https://example.org/news/exampleai-s1"},
+      "publishedAt": "2026-10-26T11:00:00.000Z",
+      "category": "industry",
+      "score": 77,
+      "selected": true,
+      "reason": "（假数据）财务类。"
+    },
+    {
+      "id": "fake-005",
+      "title": "观点：你可能过度提示了——少写提示词反而更好",
+      "originalTitle": "You are overprompting",
+      "summary": "虚构作者认为新一代模型需要更少的提示词，单一明确目标加验证条件即可。（假数据，仅用于测试）",
+      "source": {"name": "ExamplePerson：Blog（RSS）"},
+      "links": {"aihot": "https://aihot.news/items/fake-005", "original": "https://example.org/blog/overprompting"},
+      "publishedAt": "2026-10-29T06:13:39.000Z",
+      "category": "opinion",
+      "score": 73,
+      "selected": true,
+      "reason": "（假数据）观点类。"
+    },
+    {
+      "id": "fake-006",
+      "title": "安全事件：虚构平台 DataLeak 泄露 67000 条用户对话",
+      "originalTitle": "DataLeak breach",
+      "summary": "虚构安全公司披露 AI 平台 DataLeak 因智能体配置错误泄露 67000 条用户对话记录。（假数据，仅用于测试）",
+      "source": {"name": "ExampleSec：Research（安全研究）"},
+      "links": {"aihot": "https://aihot.news/items/fake-006", "original": "https://example.org/research/dataleak"},
+      "publishedAt": "2026-10-25T10:00:00.000Z",
+      "category": "paper",
+      "score": 70,
+      "selected": true,
+      "reason": "（假数据）安全事件。"
+    },
+    {
+      "id": "fake-007",
+      "title": "ExampleTranslate 新增实时会议翻译：支持 40 种语言免费试用",
+      "originalTitle": "Realtime meeting translation",
+      "summary": "虚构产品 ExampleTranslate 宣布新增实时会议翻译功能，40 种语言，基础档免费。（假数据，仅用于测试）",
+      "source": {"name": "ExampleTranslate：官网动态（RSS）"},
+      "links": {"aihot": "https://aihot.news/items/fake-007", "original": "https://example.com/meet-translate"},
+      "publishedAt": "2026-10-29T15:00:00.000Z",
+      "category": "ai-products",
+      "score": 68,
+      "selected": true,
+      "reason": "（假数据）产品更新。"
+    },
+    {
+      "id": "fake-008",
+      "title": "开源模型 FakeLM-3 发布：消费级显卡可跑",
+      "originalTitle": "FakeLM-3 open weights",
+      "summary": "虚构团队开源 FakeLM-3 模型权重，4GB 显存即可运行，支持中文。（假数据，仅用于测试）",
+      "source": {"name": "FakeLM：Hugging Face 博客"},
+      "links": {"aihot": "https://aihot.news/items/fake-008", "original": "https://example.org/fakelm3"},
+      "publishedAt": "2026-10-24T09:00:00.000Z",
+      "category": "ai-models",
+      "score": 71,
+      "selected": true,
+      "reason": "（假数据）模型发布。"
+    }
+  ]
+}
