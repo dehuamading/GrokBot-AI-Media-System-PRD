@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "选题卡（PRD 5.4：推荐给用户的 5—10 个选题）",
+  "type": "object",
+  "required": ["topic_id", "拟定标题", "建议平台", "面向谁", "核心价值",
+               "为什么现在", "关联素材", "需求证据", "可信度与风险",
+               "最强反证", "差异与难度", "推荐级别", "推荐理由"],
+  "properties": {
+    "topic_id": {"type": "string"},
+    "拟定标题": {"type": "string"},
+    "建议平台": {"enum": ["抖音", "小红书", "两者"]},
+    "面向谁": {"type": "string"},
+    "核心价值": {"type": "string"},
+    "为什么现在": {"type": "string"},
+    "关联素材": {"type": "array", "items": {"type": "string"},
+      "description": "item_id 列表，必须真实存在于 01_原始素材"},
+    "需求证据": {"type": "string",
+      "description": "无直接证据时明确标注『待验证』"},
+    "可信度与风险": {"type": "string"},
+    "最强反证": {"type": "string", "description": "可能不值得做的原因"},
+    "差异与难度": {"type": "string"},
+    "推荐级别": {"enum": ["推荐", "备选", "观察"]},
+    "推荐理由": {"type": "string"},
+    "用户选择结果": {"enum": ["待用户选择", "已选定", "未选用"],
+      "default": "待用户选择"}
+  }
+}

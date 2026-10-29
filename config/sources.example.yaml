@@ -1,0 +1,37 @@
+# 信息源配置模板（来源与权重可在运行时调整，属运营参数而非已验证最佳比例）
+sources:
+  aihot:
+    enabled: true
+    base_url: https://aihot.news
+    mode: selected          # /api/v1/items，匿名只读
+    limit: 20               # P1 小规模约束：单轮 ≤ 20 条
+    window: 7d
+    note: robots.txt 放行 /api/v1；旧 /api/public/* 已于 2026-10-31 停服，禁用
+
+  x_following:
+    enabled: true
+    # Pi Agent 不访问 X；名单由 Grok Bot 读取后以文件交付（任务02 决定）
+    list_file: /workspace/ai-zimeiti/inputs/x_following.json
+    content_available: false   # X 帖子内容不可得 → 已知缺口，报告中注明
+
+  x_discovery:
+    enabled: false         # 未授权，不启用
+
+  overseas_case:
+    enabled: false         # P1 未接，未完成项见 docs/phase-reports
+
+  github_domestic:
+    enabled: false         # 只读入口预留（PRD 3.5 D 级），未配置
+
+  feishu_domestic:
+    enabled: false         # 只读入口预留（PRD 3.5 D 级），未配置
+
+weights:                   # 优先级（PRD 3.6）：可调参数
+  x_following: 5
+  aihot: 3
+  x_discovery: 2
+  overseas_case: 1
+
+limits:
+  notion_throttle_seconds: 0.35   # ≈2.9 req/s < Notion 3 req/s
+  retry_max: 4

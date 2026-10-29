@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "统一素材条目（PRD 第 4 节）",
+  "type": "object",
+  "required": ["item_id", "source_type", "source_url", "author_or_publisher",
+               "published_at", "collected_at", "title_or_summary",
+               "evidence_status", "processing_status"],
+  "properties": {
+    "item_id": {"type": "string", "description": "source:original_id_or_hash，幂等主键"},
+    "source_type": {"enum": ["x_following", "x_discovery", "aihot", "overseas_case",
+                              "github_domestic", "feishu_domestic", "manual"]},
+    "source_url": {"type": "string"},
+    "author_or_publisher": {"type": "string"},
+    "published_at": {"type": ["string", "null"], "description": "ISO-8601 或 null"},
+    "collected_at": {"type": "string"},
+    "title_or_summary": {"type": "string"},
+    "raw_reference": {"type": "string", "description": "链接或授权短摘录，不冒充原文"},
+    "claims": {"type": "array", "items": {"type": "string"}},
+    "evidence_status": {"enum": ["verified", "self_reported", "third_party", "unverified"]},
+    "target_user_hypotheses": {"type": "array", "items": {"type": "string"}},
+    "user_problem_evidence": {"type": "array", "items": {"type": "string"},
+      "description": "无证据时必须留空，禁止编造"},
+    "tool_or_method": {"type": "array", "items": {"type": "string"}},
+    "duplicate_of": {"type": ["string", "null"]},
+    "processing_status": {"enum": ["new", "screened", "candidate", "archived"]},
+    "extra": {"type": "object", "description": "来源特有字段（category/score 等）"}
+  }
+}

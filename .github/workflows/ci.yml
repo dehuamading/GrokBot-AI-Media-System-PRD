@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+# 红线：不使用 schedule（定时任务）触发 —— 仅 push/PR 手动演进
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: 单元测试（无网络、无密钥、假数据/mock）
+        run: python -m pytest tests/ -q
+      - name: 工作流 dry-run（不写 Notion、不访问 X、不真实抓取）
+        env:
+          NOTION_ROOT_PAGE_ID: "408d7d3b292381068024e0548308c638"
+        run: |
+          python -m src.workflows.run collect \
+            --page-id "$NOTION_ROOT_PAGE_ID" \
+            --aihot-file data/examples/aihot_fake_sample.json \
+            --x-following data/examples/x_following.example.json \
+            --dry-run

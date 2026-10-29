@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "文案与版本（PRD 6：每题×每平台仅 1 份，持续修订）",
+  "type": "object",
+  "required": ["draft_id", "topic_id", "platform", "version", "status", "content"],
+  "properties": {
+    "draft_id": {"type": "string"},
+    "topic_id": {"type": "string"},
+    "platform": {"enum": ["抖音", "小红书"]},
+    "version": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["V1", "修订中", "已确认"]},
+    "content": {"type": "object", "description": "标题/正文/口播稿/画面提示等"},
+    "fact_check": {"type": "array", "items": {"type": "string"},
+      "description": "事实核对清单（PRD 6.3）"},
+    "sources": {"type": "array", "items": {"type": "string"}},
+    "unverified_notes": {"type": "string", "description": "未证实内容提醒"},
+    "feedback_history": {"type": "array", "items": {"type": "object"},
+      "description": "每次修订：feedback_text/interpreted_change/change_summary/accepted_by_user/timestamp"}
+  }
+}

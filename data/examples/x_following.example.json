@@ -1,0 +1,20 @@
+[
+  {
+    "username": "example_ai_builder",
+    "name": "示例·AI 工具实测",
+    "description": "（脱敏示例）分享普通人可上手的 AI 工具与工作流实测",
+    "followers": 12000
+  },
+  {
+    "username": "example_indie_hacker",
+    "name": "示例·独立开发日记",
+    "description": "（脱敏示例）个人项目 | AI 编程 | 出海副业",
+    "followers": 3400
+  },
+  {
+    "username": "example_office_ai",
+    "name": "示例·办公提效",
+    "description": "（脱敏示例）Excel/PPT/文档自动化与 AI 提效技巧",
+    "followers": 56000
+  }
+]
