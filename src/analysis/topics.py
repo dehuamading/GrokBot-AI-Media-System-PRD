@@ -34,17 +34,19 @@ AUDIENCE_BY_TYPE = {
 
 
 def build_topic_cards(materials: list[dict], top_k: int = 8,
-                      now: datetime | None = None) -> tuple[list[dict], list[dict]]:
+                      now: datetime | None = None,
+                      profile=None) -> tuple[list[dict], list[dict]]:
     """返回 (选题卡列表, 打分明细列表)。
 
     卡片按总分降序取前 top_k（上限 10）；不足 5 张时原样返回并打
     insufficient 标记（调用方决定是否仍写入 Notion）。
+    profile：可选受众画像（任务05），传入则评分使用画像信号。
     """
     now = now or datetime.now(timezone.utc)
     details = []
     for it in materials:
         ctype, creason = classify_item(it)
-        sc = score_item(it, now=now)
+        sc = score_item(it, now=now, profile=profile)
         details.append({"item": it, "content_type": ctype, "classify_reason": creason,
                         "score": sc})
     details.sort(key=lambda d: (-d["score"]["total"], d["item"]["item_id"]))

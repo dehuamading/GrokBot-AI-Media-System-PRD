@@ -25,6 +25,7 @@ REQUIRED_FIELDS = [
 
 VALID_SOURCE_TYPES = {
     "x_following",
+    "x_posts",  # 任务05：X 帖子文件（本地 JSON，由用户侧工具导出；程序不访问 X）
     "x_discovery",
     "aihot",
     "overseas_case",
@@ -135,6 +136,49 @@ def normalize_x_account(raw: dict) -> dict:
         "collected_at": iso_now(),
         "processing_status": "screened",
         "content_gap": "X 帖子内容不可得（Pi Agent 不访问 X）；账号仅作情报名单",
+    }
+
+
+def normalize_x_post(raw: dict) -> dict:
+    """把 X 帖子文件的单条记录（任务05：inputs/x_posts_24h.json，本地 JSON，不访问 X）
+    映射为统一素材格式。
+
+    字段：id,url,author_username,author_name,created_at,text,lang,likes,
+    reposts,replies,quotes,impressions,links。
+    - source_url 必须原样使用文件里的 url（任务05 硬约束，不做规范化改写）；
+    - 证据等级 self_reported：帖子是作者自述，未交叉核验；
+    - 互动数据放 extra，供预筛与选题卡「需求信号」参考。
+    """
+    text = (raw.get("text") or "").strip()
+    username = raw.get("author_username") or ""
+    author = f"{raw.get('author_name') or ''} (@{username})".strip()
+    links = [x for x in (raw.get("links") or []) if x]
+    return {
+        "item_id": make_item_id("x_posts", str(raw.get("id") or "")),
+        "source_type": "x_posts",
+        "source_url": raw.get("url") or "",  # 原样使用，不规范化
+        "author_or_publisher": author,
+        "published_at": raw.get("created_at") or None,
+        "collected_at": iso_now(),
+        "title_or_summary": text[:500],
+        "raw_reference": "X 帖子（本地文件输入，任务05；程序不访问 X）",
+        "claims": [text[:2000]] if text else [],
+        "evidence_status": "self_reported",
+        "target_user_hypotheses": [],
+        "user_problem_evidence": [],
+        "tool_or_method": [],
+        "duplicate_of": None,
+        "processing_status": "new",
+        "extra": {
+            "author_username": username,
+            "lang": raw.get("lang"),
+            "likes": raw.get("likes") or 0,
+            "reposts": raw.get("reposts") or 0,
+            "replies": raw.get("replies") or 0,
+            "quotes": raw.get("quotes") or 0,
+            "impressions": raw.get("impressions") or 0,
+            "links": links,
+        },
     }
 
 

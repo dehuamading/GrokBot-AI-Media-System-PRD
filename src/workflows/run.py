@@ -20,10 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.analysis.audience import load_profile  # noqa: E402
 from src.analysis.scoring import SCORING_VERSION  # noqa: E402
 from src.llm.base import DraftClient  # noqa: E402
 from src.llm.template_client import TemplateClient  # noqa: E402
 from src.normalize import iso_now  # noqa: E402
+from src.notion_store.audience_page import ensure_audience_page  # noqa: E402
 from src.notion_store.bootstrap import ensure_kb, ensure_kb_upgrades  # noqa: E402
 from src.notion_store.client import (NotionClient, date_prop, rt,  # noqa: E402
                                      select_prop)
@@ -60,22 +62,61 @@ def _load_materials_from_state(state) -> list[dict]:
 
 # ---------------------------------------------------------------------- collect
 def cmd_collect(args) -> int:
+    from src.analysis import llm_topics
+
     state = WorkflowState(args.state)
     if not args.dry_run:
         state.load()
+    profile = None
+    if args.audience:
+        profile = load_profile(args.audience)  # 缺文件/缺字段直接报错，不静默拿错受众
+    dry = _DryState(args.state)
     out = pipeline.step_collect(
-        state if not args.dry_run else _DryState(args.state),
+        state if not args.dry_run else dry,
         aihot_file=args.aihot_file, x_following_file=args.x_following,
+        x_posts_file=args.x_posts,
         live=args.live, snapshot_dir=None if args.dry_run else "data/raw")
-    ana = pipeline.step_analyze(state if not args.dry_run else _DryState(args.state),
-                                out["materials"], top_k=args.top_k)
+
+    analyze_meta = {"engine": f"heuristic:{SCORING_VERSION}"}
+    use_glm = (getattr(args, "analyze", "heuristic") == "glm" and not args.dry_run)
+    if use_glm:
+        from src.llm.glm import GLMChat
+        chat = GLMChat()  # 需 GLM_API_BASE/GLM_API_KEY 环境变量；缺则报错退出
+        short = llm_topics.shortlist(out["materials"], k=args.shortlist, profile=profile)
+        glm_scores = llm_topics.glm_score_posts(chat, short, profile)
+        cards, meta = llm_topics.glm_build_cards(chat, short, profile,
+                                                 glm_scores=glm_scores)
+        analyze_meta = {"engine": meta["engine"], "glm_calls": meta["glm_calls"],
+                        "shortlist": len(short), "scored": len(glm_scores),
+                        "dropped_cards": meta["dropped"]}
+        details = []
+        used = {iid for c in cards for iid in c["关联素材"]}
+        for m in out["materials"]:
+            if m["item_id"] not in used:
+                continue
+            gs = glm_scores.get(m["item_id"])
+            if gs:
+                m["screen_score"] = round(gs["score"])
+                m["screen_reasons"] = [f"GLM受众评分 {gs['score']}/10：{gs['reason']}"]
+            m["processing_status"] = "candidate"
+        ana = {"cards": cards, "details": details}
+    else:
+        if getattr(args, "analyze", "heuristic") == "glm":
+            print("[dry-run] glm 分析不真实调用（省 token），回退启发式展示")
+        ana = pipeline.step_analyze(state if not args.dry_run else dry,
+                                    out["materials"], top_k=args.top_k,
+                                    profile=profile)
 
     print(f"[S1] 素材 {len(out['materials'])} 条（去重丢弃 {len(out['dropped'])}，"
-          f"{'真实拉取' if args.live else '离线回放'}）；X 账号 {len(out['accounts'])} 个（仅文件）")
-    print(f"[S2] 选题卡 {len(ana['cards'])} 张（评分版本 {SCORING_VERSION}，"
-          f"推荐 {sum(1 for c in ana['cards'] if c['推荐级别'] == '推荐')} / "
-          f"备选 {sum(1 for c in ana['cards'] if c['推荐级别'] == '备选')} / "
-          f"观察 {sum(1 for c in ana['cards'] if c['推荐级别'] == '观察')}）")
+          f"{'真实拉取' if args.live else '离线回放'}；X 帖子文件 {out['x_posts']} 条；"
+          f"X 账号 {len(out['accounts'])} 个（仅文件）")
+    print(f"[S2] 分析引擎：{analyze_meta['engine']}；选题卡 {len(ana['cards'])} 张"
+          + (f"（GLM 调用 {analyze_meta['glm_calls']} 次，候选 {analyze_meta['shortlist']} 条）"
+             if 'glm_calls' in analyze_meta else
+             f"（评分版本 {SCORING_VERSION}，推荐 "
+             f"{sum(1 for c in ana['cards'] if c['推荐级别'] == '推荐')} / "
+             f"备选 {sum(1 for c in ana['cards'] if c['推荐级别'] == '备选')} / "
+             f"观察 {sum(1 for c in ana['cards'] if c['推荐级别'] == '观察')}）"))
     if len(ana["cards"]) < 5:
         print(f"⚠️ 选题卡不足 5 张（{len(ana['cards'])}），仍按规则写入并标记 insufficient")
 
@@ -89,10 +130,13 @@ def cmd_collect(args) -> int:
     db_ids = ensure_kb(client, args.page_id)
     added = ensure_kb_upgrades(client, db_ids)
     if any(added.values()):
-        print(f"[KB] 只增列升级：{ {k: v for k, v in added.items() if v} }")
-    state.update(db_ids=db_ids, page_root=args.page_id)
-    w = pipeline.step_write_topics(client, db_ids, ana["cards"], out["materials"])
-    print(f"[S3] Notion 写入：素材 {w['materials_written']} 条、选题卡 {w['topics_written']} 张"
+        print(f"[KB] 只增列/只增选项升级：{ {k: v for k, v in added.items() if v} }")
+    state.update(db_ids=db_ids, page_root=args.page_id,
+                 audience_profile=profile.profile_id if profile else None)
+    w = pipeline.step_write_topics(client, db_ids, ana["cards"], out["materials"],
+                                   only_referenced=True)
+    print(f"[S3] Notion 写入：素材 {w['materials_written']} 条（仅被选题卡引用，池总量 "
+          f"{len(out['materials'])}）、选题卡 {w['topics_written']} 张"
           f"（用户选择结果=待用户选择）")
 
     cards_path = Path(args.state).parent / "cards.json"
@@ -100,14 +144,31 @@ def cmd_collect(args) -> int:
     cards_path.write_text(json.dumps(ana["cards"], ensure_ascii=False, indent=2),
                           encoding="utf-8")
     state.update(cards_path=str(cards_path),
-                 gate1={"status": "waiting", "selected": []})
+                 gate1={"status": "waiting", "selected": []},
+                 last_analyze=analyze_meta)
     state.save()
-    audit_event(client, db_ids, f"task03-collect-{iso_now()}", "工作流",
+    audit_event(client, db_ids, f"task05-collect-{iso_now()}", "工作流",
                 "collect+analyze+write_topics", True,
-                f"素材{w['materials_written']} 选题{w['topics_written']} 已停GATE-1")
+                f"引擎{analyze_meta['engine']} 素材{w['materials_written']} "
+                f"选题{w['topics_written']} 已停GATE-1")
     print("⏸ GATE-1（第一人工关口）：请到 Notion「03_选题决策」把 1–3 张卡"
           "「用户选择结果」改为 已选定（可另选「用户指定平台」），然后运行："
           "python3 -m src.workflows.run draft")
+    return 0
+
+
+# ------------------------------------------------------------------ audience
+def cmd_write_audience(args) -> int:
+    """任务05：把受众画像写入 Notion「用户画像」子页面（幂等，已存在不改动）。"""
+    profile = load_profile(args.audience)
+    client = NotionClient()
+    db_ids = ensure_kb(client, args.page_id)
+    page, created = ensure_audience_page(client, args.page_id, profile)
+    url = f"https://www.notion.so/{page.replace('-', '')}"
+    audit_event(client, db_ids, f"task05-audience-{iso_now()}", "用户画像",
+                "write_audience_page", True,
+                f"{profile.profile_id} {'新建' if created else '已存在未改动'}")
+    print(f"{'✅ 已新建' if created else 'ℹ️ 已存在（未改动）'}：用户画像（{profile.profile_id}） → {url}")
     return 0
 
 
@@ -242,9 +303,21 @@ def main() -> int:
     p = sub.add_parser("collect", parents=[common], help="S1+S2+S3 → 停在 GATE-1")
     p.add_argument("--aihot-file", default="data/examples/aihot_fake_sample.json")
     p.add_argument("--x-following", default="/workspace/ai-zimeiti/inputs/x_following.json")
+    p.add_argument("--x-posts", default=None,
+                   help="X 帖子文件（本地 JSON，任务05；只读不联网）")
     p.add_argument("--live", action="store_true", help="真实拉取 aihot（≤20 条，默认离线回放）")
+    p.add_argument("--audience", default="config/audience_profile.yaml",
+                   help="受众画像 YAML（评分依据，任务05）")
+    p.add_argument("--analyze", default="heuristic", choices=["heuristic", "glm"],
+                   help="分析引擎：heuristic 本地启发式；glm 用户自备 GLM 套餐")
+    p.add_argument("--shortlist", type=int, default=60,
+                   help="glm 路径的本地预筛候选数（控成本）")
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("write-audience", parents=[common],
+                       help="把受众画像写入 Notion「用户画像」页（幂等）")
+    p.add_argument("--audience", default="config/audience_profile.yaml")
 
     p = sub.add_parser("gate1", parents=[common], help="读取 GATE-1 选择结果")
     p.add_argument("--draft", action="store_true")
@@ -263,6 +336,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.cmd == "collect":
         return cmd_collect(args)
+    if args.cmd == "write-audience":
+        return cmd_write_audience(args)
     if args.cmd == "gate1":
         args.llm = getattr(args, "llm", "template")
         return cmd_gate1(args, auto_draft=args.draft)

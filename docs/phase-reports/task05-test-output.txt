@@ -1,0 +1,5 @@
+......................................................................   [100%]
+70 passed in 0.29s
+tests/test_x_posts.py::test_step_collect_without_x_posts_backward_compatible
+
+70 tests collected in 0.13s

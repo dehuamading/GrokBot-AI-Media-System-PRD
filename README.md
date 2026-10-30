@@ -2,13 +2,14 @@
 
 以 X 关注账号为首要情报源、aihot.news 为核心补充的中文 AI 自媒体「情报 → 选题 → 单稿 → 复盘 → 知识沉淀」系统。按仓库根目录 PRD 文档分阶段实施（P0→P6）。
 
-## 工作流（任务03 已实现，见 docs/workflow-design.md）
+## 工作流（任务03 已实现，见 docs/workflow-design.md；任务05 增 X 帖子文件输入 + 受众画像 + GLM 分析）
 
 ```text
-[S1 抓取] aihot /api/v1(≤20条) + X关注名单文件 ─→ [S2 分析] 去重/分类/七维评分/选题卡
+[S1 抓取] aihot /api/v1(≤20条) + X关注名单文件 + X帖子文件(本地JSON,任务05)
+   ─→ [S2 分析] 去重/分类/七维评分(受众画像驱动,v2)/选题卡（可选 GLM 分析引擎）
    ─→ [S3 写 Notion] ─→ ⏸GATE-1 用户在 Notion 勾选选题 ─→ [S4 读取审核结果]
    ─→ [S5 LLM 初稿(默认离线模板引擎)] ─→ 写 Notion 04 待审 ─→ ⏸GATE-2 用户确认
-   ❌ 绝不自动发布（系统无发布代码路径）
+   ❌ 绝不自动发布（系统无发布代码路径）；X 帖子输入只读本地文件，绝不访问 X
 ```
 
 ## 快速开始
@@ -27,6 +28,13 @@ python3 -m src.workflows.run collect \
   --aihot-file data/examples/aihot_fake_sample.json \
   --x-following /workspace/ai-zimeiti/inputs/x_following.json
 #    ⏸ 到 Notion「03_选题决策」把 1–3 张卡改为「已选定」（可另选「用户指定平台」）
+
+# 3b) 任务05：X 帖子文件输入（只读本地 JSON，不联网不访问 X）+ 受众画像 + 可选 GLM 分析
+#     帖子文件由用户侧工具导出（字段 id/url/author_username/author_name/created_at/
+#     text/lang/likes/reposts/replies/quotes/impressions/links），真实文件不入库
+python3 -m src.workflows.run collect --x-posts /workspace/ai-zimeiti/inputs/x_posts_24h.json \
+  --live --analyze glm        # glm 需 GLM_API_BASE/GLM_API_KEY 环境变量（用户自备套餐）
+python3 -m src.workflows.run write-audience   # 受众画像写入 Notion「用户画像」页（幂等）
 
 # 4) 读取审核结果并生成初稿（停在第二人工关口）
 python3 -m src.workflows.run draft          # 默认 --llm template（离线零成本）

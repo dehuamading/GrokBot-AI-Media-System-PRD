@@ -40,7 +40,7 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
     }),
     "01_原始素材": ("📥", {
         "item_id": _title(),
-        "source_type": _sel("x_following", "x_discovery", "aihot", "overseas_case",
+        "source_type": _sel("x_following", "x_posts", "x_discovery", "aihot", "overseas_case",
                             "github_domestic", "feishu_domestic", "manual"),
         "source_url": _url(),
         "author_or_publisher": _rt(),
@@ -81,6 +81,12 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
         "推荐理由": _rt(),
         "用户选择结果": _sel("待用户选择", "已选定", "未选用"),
         "用户指定平台": _sel("抖音", "小红书", "两者"),
+        # 任务05 新增列（任务书 §4 选题卡必填内容；旧库经只增列升级补齐）
+        "为什么适合": _rt(),
+        "切入角度与钩子": _rt(),
+        "国内可用性": _rt(),
+        "引用帖子": _rt(),
+        "综合评分": _num(),
     }),
     "04_文案与版本": ("✍️", {
         "draft_id": _title(),
@@ -133,14 +139,28 @@ def ensure_kb(client: NotionClient, page_id: str) -> dict[str, str]:
 # 任务03 工作流升级：对既有库「只增列」（绝不删除/修改既有列与数据，红线）。
 # - 03_选题决策 ➕ 用户指定平台：GATE-1 用户可在 Notion 里指定抖音/小红书/两者
 # - 04_文案与版本 ➕ 生成引擎：记录初稿由哪个 LLM 引擎产生（透明可审计）
+# 任务05 升级（同样只增，不动既有列/数据）：
+# - 03_选题决策 ➕ 为什么适合/切入角度与钩子/国内可用性/引用帖子/综合评分
+#   （任务书 §4 选题卡必填内容；旧卡新列为空，不受影响）
+# - 01_原始素材 source_type 下拉 ➕ x_posts 选项（X 帖子文件输入，任务05）
 DB_UPGRADES: dict[str, dict] = {
     "03_选题决策": {
         "用户指定平台": {"select": {"options": [{"name": o} for o in
                                              ("抖音", "小红书", "两者")]}},
+        "为什么适合": {"rich_text": {}},
+        "切入角度与钩子": {"rich_text": {}},
+        "国内可用性": {"rich_text": {}},
+        "引用帖子": {"rich_text": {}},
+        "综合评分": {"number": {"format": "number"}},
     },
     "04_文案与版本": {
         "生成引擎": {"rich_text": {}},
     },
+}
+
+# 只增下拉选项升级（不删除既有选项，不改动已有行数据）
+DB_SELECT_OPTION_UPGRADES: dict[str, dict[str, list[str]]] = {
+    "01_原始素材": {"source_type": ["x_posts"]},
 }
 
 
@@ -151,6 +171,15 @@ def ensure_kb_upgrades(client: NotionClient, db_ids: dict[str, str]) -> dict[str
         db_id = db_ids.get(name)
         if db_id:
             added[name] = client.add_database_columns(db_id, props)
+    for name, prop_options in DB_SELECT_OPTION_UPGRADES.items():
+        db_id = db_ids.get(name)
+        if not db_id:
+            continue
+        new_opts = []
+        for prop, options in prop_options.items():
+            new_opts += client.ensure_select_options(db_id, prop, options)
+        if new_opts:
+            added.setdefault(name, []).extend(new_opts)
     return added
 
 

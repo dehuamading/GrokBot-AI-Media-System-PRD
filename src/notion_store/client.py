@@ -49,8 +49,14 @@ class NotionClient:
             if wait > 0:
                 time.sleep(wait)
             self._last_ts = time.monotonic()
-            resp = requests.request(method, url, headers=self._headers,
-                                    json=body, params=params, timeout=30)
+            try:
+                resp = requests.request(method, url, headers=self._headers,
+                                        json=body, params=params, timeout=30)
+            except requests.RequestException as e:  # 网络/超时瞬时故障 → 退避重试
+                if attempt == 4:
+                    raise NotionError(f"Notion API 网络重试耗尽: {e}") from e
+                time.sleep(2 ** attempt)
+                continue
             if resp.status_code == 429:
                 delay = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
                 time.sleep(delay)
@@ -170,6 +176,24 @@ class NotionClient:
         if missing:
             self._request("PATCH", f"/databases/{db_id}", {"properties": missing})
         return sorted(missing.keys())
+
+    def ensure_select_options(self, db_id: str, prop: str,
+                              options: list[str]) -> list[str]:
+        """只增下拉选项（幂等）：把 options 中库里还没有的选项补进去，
+        保留既有全部选项（原样回传），绝不删除/改名。返回实际新增的选项名。"""
+        schema = self.get_database(db_id).get("properties", {}).get(prop) or {}
+        if schema.get("type") != "select":
+            raise NotionError(f"属性 {prop} 不是 select，无法只增选项")
+        existing = schema.get("select", {}).get("options", [])
+        existing_names = {o.get("name") for o in existing}
+        missing = [o for o in options if o not in existing_names]
+        if not missing:
+            return []
+        merged = existing + [{"name": name} for name in missing]
+        self._request("PATCH", f"/databases/{db_id}",
+                      {"properties": {prop: {"type": "select",
+                                            "select": {"options": merged}}}})
+        return missing
 
 
 # ---------------------------------------------------------------------------

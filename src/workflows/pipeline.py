@@ -15,6 +15,7 @@ from src.analysis.scoring import SCORING_VERSION
 from src.analysis.topics import build_topic_cards
 from src.connectors.aihot_source import fetch_selected, load_from_file
 from src.connectors.x_following_source import load_following
+from src.connectors.x_posts_source import load_x_posts
 from src.llm.base import DraftClient, platforms_of
 from src.normalize import dedupe, iso_now, screen_score, validate_item
 from src.notion_store.gates import (read_gate1_selections, read_gate2_status,
@@ -22,12 +23,18 @@ from src.notion_store.gates import (read_gate1_selections, read_gate2_status,
 
 
 # ---------------------------------------------------------------------- S1
-def step_collect(state, *, aihot_file: str | Path | None, x_following_file: str | Path,
+def step_collect(state, *, aihot_file: str | Path | None = None,
+                 x_following_file: str | Path | None = None,
+                 x_posts_file: str | Path | None = None,
                  live: bool = False, snapshot_dir: str | Path = "data/raw",
-                 fetcher=fetch_selected, loader=load_from_file) -> dict:
-    """S1 数据抓取：aihot（默认离线回放；--live 才真实请求，≤20 条）+ X 名单文件。"""
-    materials = fetcher(limit=20) if live else loader(aihot_file)
-    accounts = load_following(x_following_file)
+                 fetcher=fetch_selected, loader=load_from_file,
+                 x_posts_loader=load_x_posts, following_loader=load_following) -> dict:
+    """S1 数据抓取：aihot（默认离线回放；--live 才真实请求，≤20 条）
+    + X 名单文件（账号注册表）+ X 帖子文件（任务05，纯本地 JSON，不访问 X）。"""
+    materials = fetcher(limit=20) if live else (loader(aihot_file) if aihot_file else [])
+    x_posts = x_posts_loader(x_posts_file) if x_posts_file else []
+    materials = materials + x_posts
+    accounts = following_loader(x_following_file) if x_following_file else []
     for it in materials:
         errs = validate_item(it)
         if errs:
@@ -44,17 +51,19 @@ def step_collect(state, *, aihot_file: str | Path | None, x_following_file: str 
 
     state.update(last_collect={"materials": len(materials), "dropped": len(dropped),
                                "accounts": len(accounts), "live": live,
+                               "x_posts": len(x_posts),
                                "snapshot": snapshot, "run_id": iso_now()})
     state.set_stage("collected")
     state.save()
     return {"materials": materials, "accounts": accounts, "dropped": dropped,
-            "snapshot": snapshot}
+            "snapshot": snapshot, "x_posts": len(x_posts)}
 
 
 # ---------------------------------------------------------------------- S2
-def step_analyze(state, materials: list[dict], top_k: int = 8) -> dict:
-    """S2 分析：去重(已在前置)→分类→评分→选题卡。纯本地。"""
-    cards, details = build_topic_cards(materials, top_k=top_k)
+def step_analyze(state, materials: list[dict], top_k: int = 8,
+                 profile=None) -> dict:
+    """S2 分析：去重(已在前置)→分类→评分→选题卡。纯本地（启发式；GLM 路径见 run.py）。"""
+    cards, details = build_topic_cards(materials, top_k=top_k, profile=profile)
     for d in details:
         d["item"]["content_type"] = d["content_type"]
         sc = d["score"]
@@ -76,11 +85,19 @@ def step_analyze(state, materials: list[dict], top_k: int = 8) -> dict:
 
 # ---------------------------------------------------------------------- S3
 def step_write_topics(client, db_ids, cards: list[dict],
-                      materials: list[dict], page_ids: dict[str, str] | None = None) -> dict:
-    """S3 写入 Notion：01 更新分数/状态；03 upsert 选题卡（待用户选择）。"""
+                      materials: list[dict], page_ids: dict[str, str] | None = None,
+                      only_referenced: bool = True) -> dict:
+    """S3 写入 Notion：01 更新分数/状态；03 upsert 选题卡（待用户选择）。
+
+    only_referenced=True（任务05）：01 只写被选题卡引用到的素材，
+    避免把上千条原始帖子写进 Notion。
+    """
     from src.notion_store.client import (date_prop, number_prop, rt,
                                          select_prop, url_prop)
     page_ids = page_ids or {}
+    if only_referenced:
+        used_ids = {iid for c in cards for iid in c["关联素材"]}
+        materials = [m for m in materials if m["item_id"] in used_ids]
     n_mat = 0
     for it in materials:
         extra = it.get("extra") or {}
@@ -113,9 +130,16 @@ def step_write_topics(client, db_ids, cards: list[dict],
             "最强反证": rt(c["最强反证"]), "差异与难度": rt(c["差异与难度"]),
             "推荐级别": select_prop(c["推荐级别"]), "推荐理由": rt(c["推荐理由"]),
             "用户选择结果": select_prop("待用户选择"),
+            # 任务05 新增列（只增列升级，不存在时自动补）：
+            "为什么适合": rt(c.get("为什么适合")),
+            "切入角度与钩子": rt(c.get("切入角度与钩子")),
+            "国内可用性": rt(c.get("国内可用性")),
+            "引用帖子": rt(c.get("引用帖子")),
+            "综合评分": number_prop(c.get("综合评分")),
         })
         n_top += 1
-    return {"materials_written": n_mat, "topics_written": n_top}
+    return {"materials_written": n_mat, "topics_written": n_top,
+            "materials_total": len(materials)}
 
 
 # ---------------------------------------------------------------------- S4

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-SCORING_VERSION = "v1-heuristic"
+from src.analysis.audience import match_audience
+
+SCORING_VERSION = "v2-audience"  # v1-heuristic → 任务05：受众画像驱动（负面信号降权）
 
 DIMS = ["真实用户价值", "信息可信度", "受众匹配", "新颖与时效",
         "可讲清与可验证", "传播潜力假设", "制作成本"]
@@ -35,8 +37,15 @@ def _dim(name: str, points: int, reason: str) -> dict:
     return {"name": name, "grade": _grade(points), "points": points, "reason": reason}
 
 
-def score_item(item: dict, now: datetime | None = None) -> dict:
-    """对单条素材评分，返回 {total, level, version, dimensions[], notes}。"""
+def score_item(item: dict, now: datetime | None = None,
+                profile=None) -> dict:
+    """对单条素材评分，返回 {total, level, version, dimensions[], notes}。
+
+    profile：可选 src.analysis.audience.AudienceProfile（任务05）。传入时：
+    - 「受众匹配」维度改用画像信号（高/中信号 + 负面信号硬归零）；
+    - 命中负面信号（受众无关，如加密货币/摃毛/外国政治）再对总分降权，
+      保证与受众无关的内容低分（任务05 硬要求）；评分版本号携带 profile_id。
+    """
     now = now or datetime.now(timezone.utc)
     text = ((item.get("title_or_summary") or "") + " " +
             " ".join(item.get("claims") or [])).lower()
@@ -51,10 +60,16 @@ def score_item(item: dict, now: datetime | None = None) -> dict:
     ev = item.get("evidence_status") or "unverified"
     r2 = f"证据等级 {ev}（{'官方渠道' if ev == 'verified' else '具名第三方' if ev == 'third_party' else '来源可核' if ev == 'self_reported' else '无交叉核验'}）"
 
-    # 3) 受众匹配：目标人群场景词
-    aud = [k for k in AUDIENCE_KEYWORDS if k in text]
-    aud_pts = 2 if len(aud) >= 2 else (1 if len(aud) == 1 else 0)
-    r3 = f"命中目标人群场景词 {aud[:3]}" if aud else "未命中显式人群场景词（待验证）"
+    # 3) 受众匹配：画像信号优先（任务05）；无画像时回退 v1 人群场景词
+    aud_notes: list[str] = []
+    if profile is not None:
+        aud_pts, aud_notes, neg_hits = match_audience(text, profile)
+        r3 = "; ".join(aud_notes)
+    else:
+        aud = [k for k in AUDIENCE_KEYWORDS if k in text]
+        aud_pts = 2 if len(aud) >= 2 else (1 if len(aud) == 1 else 0)
+        r3 = f"命中目标人群场景词 {aud[:3]}" if aud else "未命中显式人群场景词（待验证）"
+        neg_hits = []
 
     # 4) 新颖与时效：发布时间距 now
     pub = item.get("published_at")
@@ -99,11 +114,19 @@ def score_item(item: dict, now: datetime | None = None) -> dict:
         _dim(DIMS[6], cost_pts, r7),
     ]
     total = sum(d["points"] for d in dims)  # 0–14
+    neg_penalty = 0
+    if neg_hits:
+        neg_penalty = 2 * min(2, len(neg_hits))
+        total = max(0, total - neg_penalty)
     level = "推荐" if total >= 10 else ("备选" if total >= 7 else "观察")
+    version = SCORING_VERSION if profile is None else f"{SCORING_VERSION}+{profile.profile_id}"
+    notes = ("七维启发式评分（HYP-002，未验证），仅用于排序辅助，不承诺传播效果")
+    if neg_penalty:
+        notes += f"；受众无关信号降权 -{neg_penalty}（画像 {profile.profile_id}）"
     return {
         "total": total,
         "level": level,
-        "version": SCORING_VERSION,
+        "version": version,
         "dimensions": dims,
-        "notes": "七维启发式评分（HYP-002，未验证），仅用于排序辅助，不承诺传播效果",
+        "notes": notes,
     }

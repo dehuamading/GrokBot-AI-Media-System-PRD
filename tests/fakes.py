@@ -75,15 +75,30 @@ class FakeNotionClient:
                 return sorted(missing.keys())
         raise KeyError(db_id)
 
+    def ensure_select_options(self, db_id, prop, options):
+        self.calls.append("ensure_select_options")
+        for db in self.databases.values():
+            if db["id"] == db_id:
+                schema = db["properties"].get(prop) or {}
+                if "select" not in schema:
+                    raise ValueError(f"属性 {prop} 不是 select")
+                names = [o["name"] for o in schema["select"]["options"]]
+                missing = [o for o in options if o not in names]
+                schema["select"]["options"] += [{"name": n} for n in missing]
+                return missing
+        raise KeyError(db_id)
+
     def create_page(self, parent, properties, children=None):
         self.calls.append("create_page")
         pid = self._new_id()
         self.pages[pid] = {"parent_db": parent.get("database_id"),
+                           "parent_page": parent.get("page_id"),
                            "properties": {k: self._norm_prop(v)
                                           for k, v in properties.items()},
                            "children": list(children or [])}
-        db = self._db(parent.get("database_id"))
-        db["rows"].append(pid)
+        if parent.get("database_id"):
+            db = self._db(parent["database_id"])
+            db["rows"].append(pid)
         return {"id": pid}
 
     def update_page(self, page_id, properties):
@@ -96,6 +111,16 @@ class FakeNotionClient:
         self.calls.append("append_blocks")
         self.pages[page_id]["children"].extend(children)
         return {"appended": len(children)}
+
+    def child_pages(self, page_id):
+        self.calls.append("child_pages")
+        out = {}
+        for pid, p in self.pages.items():
+            if p.get("parent_page") == page_id:
+                title = "".join(x["text"]["content"]
+                                for x in p["properties"].get("title", {}).get("title", []))
+                out[title or f"untitled-{pid}"] = pid
+        return out
 
     def _db(self, db_id):
         for db in self.databases.values():
