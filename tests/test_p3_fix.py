@@ -21,11 +21,13 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.analysis import topics as topics_module
 from src.analysis.audience import load_profile
+from src.analysis.classify import classify_item
 from src.analysis.llm_topics import shortlist
 from src.analysis.preference import load_recent_preferences
 from src.analysis.scoring import merge_dual_tracks, score_item_v3
-from src.analysis.topics import build_topic_cards
+from src.analysis.topics import TYPE_TEMPLATES, build_topic_cards
 from src.connectors import official_source
 from src.connectors.official_source import fetch_official
 from src.notion_store.bootstrap import ensure_kb, ensure_kb_upgrades
@@ -393,3 +395,47 @@ def test_fetch_official_limit_parameter_overrides_per_source_config(monkeypatch)
     assert len(out["items"]) == 2  # 每源 1 条，而不是配置里的 3 条
     assert out["per_source"]["a"]["items"] == 1
     assert out["per_source"]["b"]["items"] == 1
+
+
+# --------------------------------------------------- 8) 出卡标题/核心价值/统一清洗
+def test_build_topic_cards_x_core_value_uses_summary_not_raw_truncation():
+    raw = ("这是一段超过二十个字的X帖子正文原文，@alice 在正文里写了"
+           "安装步骤和国内可用性，但全文不应嵌入选题卡核心价值。")
+    mat = _material("x_posts:core-1", "x_posts", raw,
+                    url="https://x.com/example_ai/status/9",
+                    author="Example (@example_ai)")
+
+    cards, _ = build_topic_cards([mat], top_k=1, now=NOW, profile=PROFILE)
+    card = cards[0]
+
+    assert raw[:20] not in card["核心价值"]
+    assert "@alice" not in card["核心价值"]
+    assert raw[:20] not in card["拟定标题"]
+    assert "｜" in card["拟定标题"]
+
+
+def test_build_topic_cards_non_x_keeps_original_type_title_template():
+    text = "某公司发布 AI 办公工具，免费开源，国内可用"
+    mat = _material("aihot:title-1", "aihot", text)
+    ctype, _ = classify_item(mat)
+
+    cards, _ = build_topic_cards([mat], top_k=1, now=NOW, profile=PROFILE)
+
+    assert cards[0]["拟定标题"] == TYPE_TEMPLATES[ctype][0].format(title=text)
+
+
+def test_build_topic_cards_calls_sanitize_card_before_return(monkeypatch):
+    calls = []
+    real = topics_module.sanitize_card
+
+    def spy(card, materials):
+        calls.append((card.get("topic_id"), [m["item_id"] for m in materials]))
+        return real(card, materials)
+
+    monkeypatch.setattr(topics_module, "sanitize_card", spy)
+    mat = _material("aihot:sanitize-1", "aihot", "AI 教程，国内可用，免费开源")
+
+    cards, _ = build_topic_cards([mat], top_k=1, now=NOW, profile=PROFILE)
+
+    assert len(cards) == 1
+    assert calls == [(cards[0]["topic_id"], [mat["item_id"]])]

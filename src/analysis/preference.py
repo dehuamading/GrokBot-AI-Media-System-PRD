@@ -266,11 +266,10 @@ def _llm_rules(chat, prefs: dict) -> list[str]:
               "归纳不超过 10 条候选选题规则。只输出 JSON："
               '{"rules":["规则1","规则2"]}。不要输出 JSON 以外文字。')
     user = build_preference_prompt(prefs)
+    # 与 ProviderChain 的真实签名保持一致：chat_json(system, user, **kw)
+    # （底层 chat(system, user, temperature=…, max_tokens=…)）。
     if hasattr(chat, "chat_json"):
-        try:
-            data = chat.chat_json(system, user, temperature=0.2, max_tokens=2000)
-        except TypeError:
-            data = chat.chat_json(system, user)
+        data = chat.chat_json(system, user, temperature=0.2, max_tokens=2000)
     else:
         from src.llm.glm import parse_json_loose
         data = parse_json_loose(chat.chat(system, user, temperature=0.2,
@@ -306,8 +305,11 @@ def propose_rules(client, db_ids: dict, chat=None, now: datetime | None = None) 
             engine = "template(fallback)"
 
     proposed: list[str] = []
+    created: list[str] = []
+    existing: list[str] = []
     for i, rule in enumerate(rules[:10], start=1):
-        record_id = f"R-{now.strftime('%Y%m%d')}-{i:02d}"
+        # 记录轮次，避免同日/同轮重跑时复用同一 record_id 而静默“假成功”。
+        record_id = f"R-{rounds[-1]}-{now.strftime('%Y%m%d')}-{i:02d}"
         props = {
             "类型": select_prop("候选规则"),
             "性质": select_prop("AI推断假设"),
@@ -319,8 +321,10 @@ def propose_rules(client, db_ids: dict, chat=None, now: datetime | None = None) 
             "updated_at": date_prop(now.isoformat()),
             "version": number_prop(rounds[-1]),
         }
-        _, created = client.create_row_if_absent(
+        _, was_created = client.create_row_if_absent(
             db_ids["05_经验与复盘"], "record_id", record_id, props)
         proposed.append(record_id)
-    return {"proposed": proposed, "rounds": rounds, "engine": engine,
+        (created if was_created else existing).append(record_id)
+    return {"proposed": proposed, "created": created, "existing": existing,
+            "rounds": rounds, "engine": engine,
             "reason": "候选规则已写入 05，状态=待确认；需用户手动确认"}

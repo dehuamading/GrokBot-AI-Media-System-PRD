@@ -129,10 +129,6 @@ def _log_collect_cost(args, out: dict, chat, analyze_mode: str) -> dict:
     if stats.get("list_cost") != UNKNOWN:
         note = (note + "；" if note else "") + (
             "OpenCode list_cost 为套餐额度折算，非实付")
-    else:
-        stats = _aggregate_usage(chat)
-        provider, model = _serving_label(chat, analyze_mode)
-        note = ""
     external = out.get("external_calls")
     if not isinstance(external, dict):
         external = {"github": 0, "aihot": 1 if getattr(args, "live", False) else 0,
@@ -1151,6 +1147,18 @@ def _prop_text(prop: dict | None) -> str:
     return str(prop.get("url") or prop.get("select", {}).get("name", "") or "")
 
 
+def _next_topic_sequence(client, db_id: str, day: str) -> int:
+    """读取 03 当日已有 topic_id 的最大 V 序号，返回下一个可用序号。"""
+    pattern = re.compile(rf"^TX-{re.escape(day)}-V(\d+)$")
+    max_index = 0
+    for row in client.query_database(db_id):
+        props = row.get("properties") or {}
+        match = pattern.match(_prop_text(props.get("topic_id")))
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return max_index + 1
+
+
 def _existing_material_sources(client, db_ids, candidate_ids: set[str]) -> dict:
     """从 01 查询候选素材的 source_url（用于 fallback repair 判断 example 域名）。"""
     if client is None or not db_ids or not db_ids.get("01_原始素材"):
@@ -1443,10 +1451,6 @@ def cmd_topics_round(args, *, client=None, chat=None, profile=None,
     merged, materials, classified, aggregates = _generate_round_cards(
         args, out, chat=chat, profile=profile, now=now,
         preference_text=preference_text, active_rules=active_rules)
-    for i, c in enumerate(merged, start=1):
-        c["topic_id"] = f"TX-{now.strftime('%Y%m%d')}-V{i:02d}"
-        c["用户选择结果"] = "待用户选择"
-
     used_material_ids = {iid for c in merged for iid in c.get("关联素材") or []}
     offenders = [m for m in materials
                  if is_simulated_source(m.get("item_id"), m.get("source_url"))]
@@ -1458,6 +1462,19 @@ def cmd_topics_round(args, *, client=None, chat=None, profile=None,
         for m in offenders[:5]:
             print(f"  - {m.get('item_id')} ← {m.get('source_url') or '无 URL'}")
         return 1
+
+    # 同日重跑：先查询 03 当日最大 V 序号，接续编号，避免 topic_id 冲突。
+    start_index = 1
+    if getattr(args, "write_notion", False) and not dry:
+        client = client or NotionClient()
+        db_ids = state.get("db_ids") or ensure_kb(client, args.page_id)
+        ensure_kb_upgrades(client, db_ids)
+        start_index = _next_topic_sequence(
+            client, db_ids["03_选题决策"], now.strftime("%Y%m%d"))
+    for i, c in enumerate(merged, start=start_index):
+        c["topic_id"] = f"TX-{now.strftime('%Y%m%d')}-V{i:02d}"
+        c["用户选择结果"] = "待用户选择"
+
     if not dry:
         _save_round_record(args, round_id, merged, materials, out)
 
@@ -1478,12 +1495,16 @@ def cmd_topics_round(args, *, client=None, chat=None, profile=None,
 
     # 5) 写 Notion（03 create_row_if_absent + 02 只增）→ 停 GATE-1
     if getattr(args, "write_notion", False) and not dry:
-        client = client or NotionClient()
-        db_ids = state.get("db_ids") or ensure_kb(client, args.page_id)
-        ensure_kb_upgrades(client, db_ids)
         w = pipeline.step_write_topics(
             client, db_ids, merged, materials, only_referenced=True,
             create_only=True)
+        if w["topics_written"] == 0:
+            print("❌ 03 未写入任何选题卡（0 张）：请检查 topic_id 冲突或字段缺失；"
+                  "本次不视为成功。")
+            _log_topics_round_cost(args, chat, out,
+                                   demand_count=len(classified),
+                                   card_count=len(merged))
+            return 1
         d = pipeline.step_write_demands(
             client, db_ids, aggregates, round_id=round_id)
         cards_path = Path(args.state).parent / "cards.json"

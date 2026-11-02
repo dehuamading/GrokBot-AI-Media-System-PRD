@@ -172,3 +172,62 @@ def test_rules_confirm_only_prints_manual_instruction_and_does_not_change_status
     after = FakeNotionClient.plain(
         client.row("05_经验与复盘", "record_id", record_id)["properties"]["状态"])
     assert before == after == "待确认"
+
+
+class FakeProviderChain:
+    """按 src.llm.provider_chain.ProviderChain 的真实签名 mock（无网络）。"""
+
+    model = "opencode-go/mock-rule"
+    last_provider = "opencode-go"
+    last_model = "mock-rule"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, system, user, temperature=0.3, max_tokens=6000):  # noqa: ARG002
+        self.calls += 1
+        return '{"rules":["优先国内可用工具","避免空投撸毛"]}'
+
+    def chat_json(self, system, user, temperature=0.3, max_tokens=6000):
+        self.calls += 1
+        assert temperature >= 0 and max_tokens > 0
+        return {"rules": ["优先国内可用工具", "避免空投撸毛"]}
+
+
+def test_propose_rules_llm_engine_uses_real_provider_chain_signature():
+    from datetime import datetime, timezone
+
+    client, db_ids = _db()
+    for rnd in (1, 2, 3):
+        record_feedback(client, db_ids, _feedback(topic_id=f"T-{rnd}", round_no=rnd))
+    now = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+    chat = FakeProviderChain()
+
+    out = propose_rules(client, db_ids, chat=chat, now=now)
+
+    assert chat.calls == 1
+    assert out["engine"].startswith("llm:")
+    assert out["proposed"] == out["created"]
+    assert out["existing"] == []
+    assert all(rid.startswith(f"R-3-{now.strftime('%Y%m%d')}-")
+               for rid in out["proposed"])
+
+
+def test_propose_rules_rerun_marks_existing_nonzero_and_ids_include_round():
+    from datetime import datetime, timezone
+
+    client, db_ids = _db()
+    for rnd in (1, 2, 3):
+        record_feedback(client, db_ids, _feedback(topic_id=f"T-{rnd}", round_no=rnd))
+    now = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+
+    first = propose_rules(client, db_ids, now=now)
+    second = propose_rules(client, db_ids, now=now)
+
+    assert first["proposed"]
+    assert first["created"] == first["proposed"]
+    assert first["existing"] == []
+    assert second["created"] == []
+    assert second["existing"] == second["proposed"]
+    assert all(f"R-3-{now.strftime('%Y%m%d')}-" in rid
+               for rid in second["proposed"])

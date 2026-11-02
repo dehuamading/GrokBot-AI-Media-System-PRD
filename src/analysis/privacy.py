@@ -35,8 +35,10 @@ _NO_VERBATIM_REPLACE = {"需求证据"}
 
 
 def is_x_material(material: dict) -> bool:
-    source = str(material.get("source_type") or material.get("platform") or "")
-    return source in X_SOURCES
+    """source_type 与 platform 分别判断，任一为 X 即视为 X 素材。"""
+    source_type = str(material.get("source_type") or "").strip().lower()
+    platform = str(material.get("platform") or "").strip().lower()
+    return source_type in X_SOURCES or platform in X_SOURCES
 
 
 def _compact(text: str) -> str:
@@ -111,7 +113,8 @@ def contains_verbatim(text: str, raw_texts: list[str],
 def scrub_identifiers(text: str, identifiers: list[str]) -> str:
     cleaned = str(text or "")
     for ident in identifiers:
-        if ident:
+        # 只替换足够长或明确是 @handle 的标识，避免 1–2 字短串误伤正文。
+        if ident and (len(ident) >= 3 or "@" in ident):
             cleaned = cleaned.replace(ident, "")
     cleaned = re.sub(r"@[A-Za-z0-9_]+", "", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()

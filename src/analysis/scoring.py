@@ -210,11 +210,11 @@ def _china_usability(item: dict, text: str) -> tuple[int, str, bool]:
         if "可用" in explicit or "能用" in explicit:
             return 2, f"素材标注：{explicit}", False
 
+    # 疑问句不是可用性证据，必须在“可用”等肯定字样之前判定。
+    if any(k in text for k in ("吗", "？", "?", "么")):
+        return 0, "待验证：文本是询问而非可用性证据", True
     if any(k in text for k in ("国内不可用", "无法访问", "被墙", "封禁", "不支持国内")):
         return 0, "文本提示国内不可用", False
-    if any(k in text for k in ("能用吗", "可用吗", "能用？", "可用？",
-                               "有没有国内能用", "能不能用")):
-        return 0, "待验证：文本是询问而非可用性证据", True
     if any(k in text for k in ("国内可用", "国内能用", "不用翻墙", "免翻墙",
                                "无需翻墙", "直接可用", "支持国内", "国内直接")):
         return 2, "文本提示国内可直接使用", False
@@ -498,6 +498,8 @@ def merge_dual_tracks(scored_items: list[dict], top_n: int = 10,
                 break
 
     limit = max(0, int(top_n))
+    for item in scored_items:
+        item.pop("_merge_unplaced_mandatory", None)
     merged: list[dict] = []
     while len(merged) < limit and (demand or opportunity):
         if demand:
@@ -513,12 +515,26 @@ def merge_dual_tracks(scored_items: list[dict], top_n: int = 10,
             opportunity.remove(pick)
             merged.append(pick)
 
-    # 若交替合并后配额卡仍未进入（例如需求型占满），替换末尾的非配额卡。
+    def demand_count() -> int:
+        return sum(1 for item in merged if _track_of(item) == "需求型")
+
+    # 若交替合并后配额卡仍未进入（例如需求型占满），替换末尾的非配额卡；
+    # 但若有需求型，必须保留至少 1 张，不能为了配额把需求轨全部挤出。
     for item in mandatory:
         if item in merged:
             continue
         for i in range(len(merged) - 1, -1, -1):
-            if merged[i] not in mandatory:
-                merged[i] = item
-                break
+            candidate = merged[i]
+            if candidate in mandatory:
+                continue
+            if _track_of(candidate) == "需求型" and demand_count() <= 1:
+                continue
+            merged[i] = item
+            break
+
+    # 放不下的 mandatory 不静默丢弃：在返回结果首卡上标注来源，供调用方审计。
+    unplaced = [item for item in mandatory if item not in merged]
+    if unplaced and merged:
+        merged[0]["_merge_unplaced_mandatory"] = [
+            _source_of(item) for item in unplaced]
     return merged

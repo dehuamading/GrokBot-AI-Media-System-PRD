@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -201,7 +202,9 @@ def test_topics_round_end_to_end_mock_stops_at_gate1(tmp_path, capsys):
         assert "@alice" not in ev and "13800138000" not in ev
         assert "a@b.com" not in ev and "https://example.com/x" not in ev
         cited = FakeNotionClient.plain(r["properties"]["引用帖子"])
-        assert cited.startswith("http") and "示例需求用户" not in cited
+        source_url = FakeNotionClient.plain(r["properties"]["原始来源"])
+        assert "@" not in cited and "示例需求用户" not in cited
+        assert cited == source_url
 
     # 新技术机会（aihot）与 AI 副业机会（X）均有机会型卡来源
     cited_all = " ".join(FakeNotionClient.plain(r["properties"]["引用帖子"])
@@ -239,3 +242,70 @@ def test_topics_round_end_to_end_mock_stops_at_gate1(tmp_path, capsys):
     assert record["command"].startswith("topics-round")
     assert record["cost_basis"] == COST_BASIS
     assert "套餐额度折算" in record["成本口径"]
+
+
+# ------------------------------------------------- 阶段3 审查：同日重跑编号
+def _round_args(tmp_path, **overrides):
+    base = dict(
+        state=str(tmp_path / "state.json"), page_id="root",
+        sources="aihot,x", x_file=None,
+        x_replies_file=None, aihot_file=None, import_file=None,
+        github_top=0, aihot_limit=20, official_limit=3, max_cards=10,
+        round_id="ROUND-DAY", write_notion=True, dry_run=False, live=False,
+        config=str(REPO / "config" / "sources.example.yaml"),
+        audience=str(REPO / "config" / "audience_profile.yaml"),
+        shortlist=60, analyze="llm", x_following=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_same_day_rerun_continues_topic_sequence_instead_of_conflicting(
+        tmp_path, capsys):
+    aihot_path, x_path, replies_path = _write_fixtures(tmp_path)
+    client = FakeNotionClient()
+    db_ids = ensure_kb(client, "root")
+    ensure_kb_upgrades(client, db_ids)
+    chat = FakeRoundChat()
+    args = _round_args(
+        tmp_path, x_file=str(x_path), x_replies_file=str(replies_path),
+        aihot_file=str(aihot_path))
+    now = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+
+    assert run.cmd_topics_round(args, client=client, chat=chat, now=now) == 0
+    first_ids = [FakeNotionClient.plain(r["properties"]["topic_id"])
+                 for r in client.query_database(db_ids["03_选题决策"])]
+    assert first_ids
+
+    assert run.cmd_topics_round(args, client=client, chat=chat, now=now) == 0
+    second_ids = [FakeNotionClient.plain(r["properties"]["topic_id"])
+                  for r in client.query_database(db_ids["03_选题决策"])]
+
+    assert len(second_ids) > len(first_ids)
+    new_ids = [tid for tid in second_ids if tid not in set(first_ids)]
+    assert new_ids
+    assert set(first_ids).isdisjoint(new_ids)
+    assert all(re.search(r"^TX-20261102-V\d{2}$", tid) for tid in new_ids)
+    assert "❌" not in capsys.readouterr().out
+
+
+def test_topics_round_explicitly_reports_zero_written_cards(
+        tmp_path, monkeypatch, capsys):
+    aihot_path, x_path, replies_path = _write_fixtures(tmp_path)
+    client = FakeNotionClient()
+    db_ids = ensure_kb(client, "root")
+    ensure_kb_upgrades(client, db_ids)
+    monkeypatch.setattr(
+        run.pipeline, "step_write_topics",
+        lambda *a, **kw: {"materials_written": 0, "topics_written": 0,
+                          "materials_total": 0})
+    args = _round_args(
+        tmp_path, x_file=str(x_path), x_replies_file=str(replies_path),
+        aihot_file=str(aihot_path))
+    now = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+
+    rc = run.cmd_topics_round(args, client=client, chat=FakeRoundChat(), now=now)
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "未写入任何选题卡" in out and "0 张" in out

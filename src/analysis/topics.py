@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 
 from src.analysis.classify import classify_item
 from src.analysis.demand import short_evidence_texts
-from src.analysis.privacy import keyword_summary
+from src.analysis.privacy import (is_x_material, keyword_summary,
+                                  sanitize_card)
 from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,
                                   score_item, score_item_v3)
 
@@ -64,8 +65,15 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
         it, sc, ctype = d["item"], d["score"], d["content_type"]
         v3 = d["v3"]
         _title_tpl, platform = TYPE_TEMPLATES[ctype]
-        # 启发式标题只用「类型｜关键词概括」，绝不截断帖子/素材原文。
-        title = f"{ctype}｜{keyword_summary(it, ctype)}"
+        # X 素材只用「类型｜关键词概括」，绝不截断帖子正文；其他来源保留原模板。
+        if is_x_material(it):
+            title = f"{ctype}｜{keyword_summary(it, ctype)}"
+            core_value = (f"用一条内容讲清「{ctype}」："
+                          f"{keyword_summary(it, ctype)}")
+        else:
+            title = _title_tpl.format(title=it.get("title_or_summary") or "")
+            core_value = (f"用一条内容讲清「{ctype}」："
+                          f"{(it.get('title_or_summary') or '')[:50]}")
         weak = sorted(sc["dimensions"], key=lambda x: x["points"])[:2]
         weakest_txt = "；".join(f"{w['name']}({w['grade']}：{w['reason']})" for w in weak)
         strong = next(x for x in sc["dimensions"] if x["name"] == "信息可信度")
@@ -80,12 +88,12 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
         else:
             demand_text = ("待验证：本轮素材池无直接用户需求证据（无评论/帖子数据）；"
                            f"仅假设「{audience}」关心此类内容，须在文案阶段或评论区补证")
-        cards.append({
+        card = {
             "topic_id": f"T-{now.strftime('%Y%m%d')}-{i:03d}",
             "拟定标题": title,
             "建议平台": platform,
             "面向谁": f"{audience}；他们想解决：{_audience_problem(ctype)}",
-            "核心价值": f"用一条内容讲清「{ctype}」：{(it.get('title_or_summary') or '')[:50]}",
+            "核心价值": core_value,
             "为什么现在": why_now,
             "关联素材": [it["item_id"]],
             "_source_urls": [it["source_url"]] if it.get("source_url") else [],
@@ -121,7 +129,9 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
             "传播潜力假设(不计分)": v3["propagation_hypothesis"]["text"],
             "综合评分": v3["total"],
             "_v3": v3,
-        })
+        }
+        # 所有出卡路径统一清洗，避免任何调用方忘记脱敏。
+        cards.append(sanitize_card(card, [it]))
     return cards, details
 
 

@@ -81,3 +81,18 @@ def test_collect_cost_log_writes_cost_basis(tmp_path):
     assert line["cost"] == 0.0012
     assert line["cost_basis"] == OPENCODE_BASIS
     assert line["成本口径"] == OPENCODE_BASIS
+
+
+def test_collect_cost_without_chat_keeps_no_llm_explanation(tmp_path):
+    """chat=None 时不得被遗留 else 覆盖为“未知且无说明”。"""
+    from src.workflows import run
+
+    args = SimpleNamespace(state=str(tmp_path / "state.json"),
+                           sources="aihot", live=False)
+
+    rec = _log_collect_cost(args, {"external_calls": {}}, None, "heuristic")
+
+    assert rec["cost"] == UNKNOWN
+    assert rec["cost_basis"] == run.NO_LLM_COST_BASIS
+    assert rec["note"]
+    assert "未调用 LLM" in rec["note"]

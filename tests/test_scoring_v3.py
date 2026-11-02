@@ -163,3 +163,123 @@ def test_only_active_rules_adjust_heuristic_ranking():
     # 认可/否决示例不传 active_rules 时不产生任何加减分
     assert score_item_v3(it, now=NOW, profile=PROFILE,
                          active_rules=[])["rule_adjustment"] == 0
+
+
+# ---------------------------------------------------------------- 阶段3 审查修复
+from src.analysis.scoring import _source_of  # noqa: E402
+
+
+def _card(ident, track, *, source=None, level="观察", total=5, track_score=2):
+    card = {"id": ident, "type": track, "track_score": track_score,
+            "total": total, "推荐级别": level}
+    if source:
+        card["_source_group"] = source
+    return card
+
+
+def test_source_of_normalizes_x_from_group_and_source_type():
+    assert _source_of({"_source_group": "x"}) == "x_posts"
+    assert _source_of({"source_type": "x"}) == "x_posts"
+    assert _source_of({"platform": "x"}) == "x_posts"
+    assert _source_of({"_source_group": "aihot"}) == "aihot"
+
+
+def test_merge_dual_tracks_top_n_2_keeps_at_least_one_demand_and_marks_overflow():
+    cards = [
+        _card("d1", "需求型", level="推荐", total=15, track_score=6),
+        _card("d2", "需求型", level="推荐", total=14, track_score=5),
+        _card("x1", "机会型", source="x_posts", level="推荐", total=15,
+              track_score=2),
+        _card("a1", "机会型", source="aihot", level="备选", total=11,
+              track_score=5),
+        _card("g1", "机会型", source="github", level="备选", total=10,
+              track_score=4),
+        _card("o1", "机会型", source="official", level="备选", total=9,
+              track_score=3),
+    ]
+    merged = merge_dual_tracks(
+        cards, top_n=2,
+        opportunity_sources=("aihot", "github", "official"))
+
+    assert len(merged) == 2
+    assert any(c["type"] == "需求型" for c in merged)
+    placed_sources = {c.get("_source_group") for c in merged}
+    assert "aihot" in placed_sources
+    overflow = merged[0].get("_merge_unplaced_mandatory")
+    assert overflow
+    assert set(overflow) == {"github", "official"}
+
+
+def test_merge_dual_tracks_top_n_3_keeps_demand_when_mandatory_overflow():
+    cards = [
+        _card("d1", "需求型", level="推荐", total=15, track_score=6),
+        _card("d2", "需求型", level="推荐", total=14, track_score=5),
+        _card("a1", "机会型", source="aihot", level="备选", total=11,
+              track_score=5),
+        _card("g1", "机会型", source="github", level="备选", total=10,
+              track_score=4),
+        _card("o1", "机会型", source="official", level="备选", total=9,
+              track_score=3),
+    ]
+    merged = merge_dual_tracks(
+        cards, top_n=3,
+        opportunity_sources=("aihot", "github", "official"))
+
+    assert len(merged) == 3
+    assert any(c["type"] == "需求型" for c in merged)
+    assert {"aihot", "github"} <= {c.get("_source_group") for c in merged}
+    assert merged[0].get("_merge_unplaced_mandatory") == ["official"]
+
+
+def test_three_same_category_comments_strictly_raise_value_dimension():
+    comments = [
+        {"text": f"安装报错求助 {i}", "demand_tags": ["安装部署"],
+         "source_url": f"https://example.com/{i}"}
+        for i in range(3)
+    ]
+    baseline = score_item_v3(_item("安装教程"), now=NOW, profile=PROFILE)
+    boosted = score_item_v3(_item("安装教程", comments=comments),
+                            now=NOW, profile=PROFILE)
+    base_dim = _dims(baseline)["真实用户价值"]
+    boosted_dim = _dims(boosted)["真实用户价值"]
+    assert base_dim["points"] < 2
+    assert boosted_dim["points"] == base_dim["points"] + 1
+    assert "升档" in boosted_dim["reason"]
+
+
+def test_side_hustle_potential_and_personal_experience_capped_at_one():
+    potential = score_item_v3(_item("AI 副业变现接单机会"),
+                              now=NOW, profile=PROFILE)
+    personal = score_item_v3(_item("我试过 AI 副业接单，分享个人经验"),
+                             now=NOW, profile=PROFILE)
+    assert _dims(potential)["副业潜力"]["points"] <= 1
+    assert potential["side_hustle_evidence_level"] == "潜在机会"
+    assert _dims(personal)["副业潜力"]["points"] <= 1
+    assert personal["side_hustle_evidence_level"] in {"个人经验", "潜在机会"}
+
+
+def test_china_usability_without_evidence_is_pending_and_scores_zero():
+    sc = score_item_v3(_item("一个没有提到可用性的新工具"),
+                       now=NOW, profile=PROFILE)
+    assert _dims(sc)["国内适用性"]["points"] == 0
+    assert sc["china_pending"] is True
+    assert _dims(sc)["国内适用性"]["reason"].startswith("待验证")
+
+
+def test_china_usability_question_sentence_is_pending_not_usable():
+    for text in ("这个工具国内可用么？", "是不是需要梯子么？"):
+        sc = score_item_v3(_item(text), now=NOW, profile=PROFILE)
+        assert _dims(sc)["国内适用性"]["points"] == 0, text
+        assert sc["china_pending"] is True, text
+
+
+def test_opportunity_track_score_is_sum_of_three_opportunity_dimensions():
+    sc = score_item_v3(
+        _item("首个新模型发布，零基础教程，国内可用，免费开源，实测新能力"),
+        now=NOW, profile=PROFILE)
+    dims = _dims(sc)
+    assert sc["type"] == "机会型"
+    assert sc["track_score"] == (dims["新技术机会"]["points"]
+                                 + dims["新颖与时效"]["points"]
+                                 + dims["国内适用性"]["points"])
+    assert sc["track_dimensions"] == ["新技术机会", "新颖与时效", "国内适用性"]
