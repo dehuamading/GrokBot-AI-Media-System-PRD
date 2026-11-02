@@ -43,13 +43,22 @@ def _engagement(m: dict) -> int:
             (e.get("replies") or 0) + (e.get("quotes") or 0))
 
 
+def _shortlist_source(m: dict) -> str:
+    source = str(m.get("source_type") or m.get("platform") or "")
+    return "x_posts" if source == "x" else source
+
+
 def shortlist(materials: list[dict], k: int = 60,
-              profile: AudienceProfile | None = None) -> list[dict]:
+              profile: AudienceProfile | None = None,
+              ensure_sources: tuple[str, ...] = (),
+              per_source_min: int = 1) -> list[dict]:
     """受众信号 + 互动数据的本地预筛。负面信号（加密货币/撸毛/政治等）重罚出局优先级。
 
     - 命中受众无关信号（负面词表：加密货币/摃毛/外国政治等）→ 直接不入候选；
     - 语言：只留画像语言（默认 zh/en）；无 lang 标记（如 aihot 条目）视为可留；
-    - 文本过短（<15 字符）跳过（多为纯链接/表情，讲不成选题）。
+    - 文本过短（<15 字符）跳过（多为纯链接/表情，讲不成选题）；
+    - ensure_sources/per_source_min：为指定来源保留最低候选数（默认不启用，
+      保持旧调用行为），确保 aihot/github/official 有机会进入后续 LLM 出卡。
     """
     scored = []
     for m in materials:
@@ -74,7 +83,30 @@ def shortlist(materials: list[dict], k: int = 60,
         pts += min(4, eng // 50)  # 互动信号封顶 4，防大V碾压内容相关性
         scored.append((pts, eng, m))
     scored.sort(key=lambda t: (-t[0], -t[1]))
-    return [m for _, _, m in scored[:k]]
+    ordered = [m for _, _, m in scored]
+    limit = max(0, int(k))
+    if not ensure_sources or limit == 0:
+        return ordered[:limit]
+
+    reserved: list[dict] = []
+    reserved_ids: set[int] = set()
+    for source in ensure_sources:
+        picks = [m for m in ordered
+                 if _shortlist_source(m) == source
+                 and id(m) not in reserved_ids][:max(0, per_source_min)]
+        for m in picks:
+            reserved.append(m)
+            reserved_ids.add(id(m))
+    if len(reserved) >= limit:
+        return reserved[:limit]
+    for m in ordered:
+        if len(reserved) >= limit:
+            break
+        if id(m) not in reserved_ids:
+            reserved.append(m)
+            reserved_ids.add(id(m))
+    selected_ids = {id(m) for m in reserved}
+    return [m for m in ordered if id(m) in selected_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +185,9 @@ CARD_SYSTEM = (
     "禁止编造事实；\n"
     "4) hook 是一句话短视频开头钩子（口语化，能留人）；counter 是最强反证"
     "（这条内容做出来最可能被质疑/扑街的点）；\n"
-    "5) platform ∈ {抖音,小红书,两者}；score 为你给的 0-10 综合分。\n"
+    "5) platform ∈ {抖音,小红书,两者}；score 为你给的 0-10 综合分；\n"
+    "6) 标题必须是中文概括改写，禁止照抄帖子原文（尤其禁止连续 >20 字原文），"
+    "禁止写入作者显示名、username 或 @handle；引用链接由程序从素材注入；\n"
     '严格只输出 JSON：{"cards":[{"title":"…","why_fit":"…","hook":"…","refs":[1],'
     '"china":"…","risk":"…","counter":"…","difficulty":"…","platform":"抖音","score":8}]}'
 )
@@ -281,10 +315,18 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
                   if chosen_type == "需求型" else mats[0])
     v3 = score_item_v3(v3_primary, now=now, profile=profile)
 
+    item_ids = [m["item_id"] for m in mats]
     try:
         score = max(0.0, min(10.0, float(raw.get("score") or 0)))
     except (TypeError, ValueError):
         score = 0.0
+    if score == 0.0 and glm_scores:
+        # 卡未给分时，用该卡引用素材的 GLM 打分兜底，避免高分素材被误判为观察。
+        fallback = [glm_scores.get(iid, {}).get("score") for iid in item_ids]
+        fallback = [float(v) for v in fallback if isinstance(v, (int, float))
+                    and not isinstance(v, bool)]
+        if fallback:
+            score = max(0.0, min(10.0, max(fallback)))
     platform = raw.get("platform") if raw.get("platform") in ("抖音", "小红书", "两者") else "两者"
 
     # 链接一律取素材记录（输入文件 url 原样），作者取素材记录
@@ -294,7 +336,6 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
     latest = max((m.get("published_at") or "" for m in mats), default="")
     eng_total = sum(_engagement(m) for m in mats)
 
-    item_ids = [m["item_id"] for m in mats]
     why_now = f"来源帖子发布于近 24 小时窗口（最新 {latest or '待验证'}）；引用帖合计互动（赞+转+评+引）约 {eng_total}"
     demand_text = ("评论证据（脱敏，≤3条）："
                    + "；".join(f"「{e}」" for e in demand_evidence)
@@ -320,6 +361,9 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         "综合评分": score,
         "为什么适合": why,
         "切入角度与钩子": hook,
+        # 内部审计字段：最终推荐级别会同时参考 LLM 分数（不改变 v3 阈值）。
+        "_llm_score": score,
+        "_llm_level": "推荐" if score >= 8 else ("备选" if score >= 6 else "观察"),
         "国内可用性": china,
         "引用帖子": cited,
         "用户选择结果": "待用户选择",

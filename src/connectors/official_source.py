@@ -152,9 +152,13 @@ def _fetch_github_releases(source: dict, limit: int, timeout: int,
 
 def fetch_official(sources: list[dict] | None = None, *,
                    config_path: str | Path | None = None,
-                   default_limit: int = 3, timeout: int = 20,
+                   default_limit: int | None = None, timeout: int = 20,
                    token: str | None = None) -> dict:
-    """抓取官方源；单源超时/失败只记 errors，不影响其他源。"""
+    """抓取官方源；单源超时/失败只记 errors，不影响其他源。
+
+    default_limit 显式传入时覆盖每个源配置里的 limit（CLI --official-limit
+    必须真正生效）。未传入时才使用源自身配置，再回退 3。
+    """
     if sources is None:
         sources = load_sources(config_path) if config_path else []
     token = token if token is not None else os.environ.get("GITHUB_TOKEN")
@@ -165,7 +169,10 @@ def fetch_official(sources: list[dict] | None = None, *,
 
     for source in sources:
         sid = str(source.get("id") or source.get("name") or "unknown")
-        limit = int(source.get("limit") or default_limit)
+        if default_limit is not None:
+            limit = max(0, int(default_limit))
+        else:
+            limit = int(source.get("limit") or 3)
         try:
             kind = source.get("type")
             warnings: list[str] = []

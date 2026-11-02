@@ -45,6 +45,9 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
     tokens = _pick(data, "tokens", default=UNKNOWN)
     cost = _normalize_cost(_pick(data, "cost", "金额", "amount"))
     cost_basis = _pick(data, "cost_basis", "成本口径", default=UNKNOWN)
+    # OpenCode Go 的 list_cost 是套餐额度按标价折算，并非实付金额。
+    list_cost = _pick(data, "list_cost", default=UNKNOWN)
+    list_cost_basis = _pick(data, "list_cost_basis", default=UNKNOWN)
     external = _pick(data, "external_api_calls", "外部API调用", "external", default={})
     note = _pick(data, "note", "备注", default="")
 
@@ -60,6 +63,8 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
         "tokens": tokens,
         "cost": cost,
         "cost_basis": cost_basis,
+        "list_cost": list_cost,
+        "list_cost_basis": list_cost_basis,
         "external_api_calls": external,
         "note": note,
         # 中文列名（与任务书字段一一对应）

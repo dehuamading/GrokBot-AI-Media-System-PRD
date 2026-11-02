@@ -459,16 +459,66 @@ def _sort_key(scored: dict):
     return (-int(track_score), -int(total), str(ident))
 
 
-def merge_dual_tracks(scored_items: list[dict], top_n: int = 10) -> list[dict]:
-    """双轨分别排序后按「需求型/机会型」交替合并，保证两类都有（除非某类为 0）。"""
+def _source_of(scored: dict) -> str:
+    source = str(scored.get("_source_group") or scored.get("source_group")
+                 or scored.get("source_type") or scored.get("platform") or "")
+    return "x_posts" if source == "x" else source
+
+
+def _reaches_alternative(scored: dict) -> bool:
+    level = scored.get("推荐级别") or scored.get("level")
+    if level in ("推荐", "备选"):
+        return True
+    total = (scored.get("ranking_total") or scored.get("adjusted_total")
+             or scored.get("综合评分") or scored.get("total") or 0)
+    try:
+        return int(total) >= V3_ALTERNATIVE_TOTAL
+    except (TypeError, ValueError):
+        return False
+
+
+def merge_dual_tracks(scored_items: list[dict], top_n: int = 10,
+                      opportunity_sources: tuple[str, ...] | None = None
+                      ) -> list[dict]:
+    """双轨分别排序后按「需求型/机会型」交替合并，保证两类都有（除非某类为 0）。
+
+    opportunity_sources：机会型来源配额。对每个来源，若存在达到「备选」及以上的
+    机会型卡，则优先纳入合并结果（每类来源至少尝试 1 张）；未达备选的不强塞。
+    """
     demand = sorted([x for x in scored_items if _track_of(x) == "需求型"],
                     key=_sort_key)
     opportunity = sorted([x for x in scored_items if _track_of(x) == "机会型"],
                          key=_sort_key)
+    mandatory: list[dict] = []
+    for source in opportunity_sources or ():
+        for item in opportunity:
+            if _source_of(item) == source and _reaches_alternative(item):
+                if item not in mandatory:
+                    mandatory.append(item)
+                break
+
+    limit = max(0, int(top_n))
     merged: list[dict] = []
-    while len(merged) < max(0, int(top_n)) and (demand or opportunity):
+    while len(merged) < limit and (demand or opportunity):
         if demand:
             merged.append(demand.pop(0))
-        if len(merged) < top_n and opportunity:
-            merged.append(opportunity.pop(0))
+        if len(merged) < limit and opportunity:
+            pick = None
+            for item in mandatory:
+                if item in opportunity:
+                    pick = item
+                    break
+            if pick is None:
+                pick = opportunity[0]
+            opportunity.remove(pick)
+            merged.append(pick)
+
+    # 若交替合并后配额卡仍未进入（例如需求型占满），替换末尾的非配额卡。
+    for item in mandatory:
+        if item in merged:
+            continue
+        for i in range(len(merged) - 1, -1, -1):
+            if merged[i] not in mandatory:
+                merged[i] = item
+                break
     return merged

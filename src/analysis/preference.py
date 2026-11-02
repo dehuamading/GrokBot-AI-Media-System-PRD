@@ -148,7 +148,13 @@ def record_feedback(client, db_ids: dict, feedback: dict) -> dict:
 
 
 def _row_to_feedback(row: dict) -> dict:
+    """按真实 05 schema 读取一行；字段名与 Notion 列一一对应。
+
+    真实列：类型/用户选择/原话反馈/原始选题/推荐理由/下轮参考/反馈时间/
+    状态/record_id（record_id 是 title 属性）。
+    """
     return {
+        "record_id": _text(row, "record_id"),
         "topic_id": _text(row, "topic_id"),
         "原始选题": _text(row, "原始选题") or _text(row, "内容"),
         "推荐理由": _text(row, "推荐理由"),
@@ -181,7 +187,9 @@ def load_recent_preferences(client, db_ids: dict, n_pos: int = 5,
         if typ == "候选规则" and status == STATUS_CANDIDATE:
             candidates.append(rec)
 
-    feedbacks.sort(key=_feedback_time, reverse=True)
+    # 反馈时间倒序；同一时间用 record_id 稳定排序，避免 Notion 返回顺序影响结果。
+    feedbacks.sort(key=lambda f: (_feedback_time(f), f.get("record_id") or ""),
+                   reverse=True)
     approved = [f for f in feedbacks if f["用户选择"] == "认可"][:max(0, n_pos)]
     rejected = [f for f in feedbacks if f["用户选择"] == "否决"][:max(0, n_neg)]
     rules.sort(key=_feedback_time, reverse=True)

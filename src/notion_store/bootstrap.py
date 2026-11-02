@@ -103,6 +103,7 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
         "轨道得分": _num(),
         "副业证据等级": _rt(),
         "传播潜力假设(不计分)": _rt(),
+        "生成引擎": _rt(),
     }),
     "04_文案与版本": ("✍️", {
         "draft_id": _title(),
@@ -193,6 +194,7 @@ DB_UPGRADES: dict[str, dict] = {
         "轨道得分": {"number": {"format": "number"}},
         "副业证据等级": {"rich_text": {}},
         "传播潜力假设(不计分)": {"rich_text": {}},
+        "生成引擎": {"rich_text": {}},
     },
     "04_文案与版本": {
         "生成引擎": {"rich_text": {}},

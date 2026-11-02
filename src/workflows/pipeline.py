@@ -284,12 +284,20 @@ def step_write_topics(client, db_ids, cards: list[dict],
     only_referenced=True（任务05）：01 只写被选题卡引用到的素材，
     避免把上千条原始帖子写进 Notion。
     """
+    from src.analysis.privacy import sanitize_card
     from src.notion_store.client import (number_prop, rt, select_prop,
                                          url_prop)
     page_ids = page_ids or {}
     if only_referenced:
         used_ids = {iid for c in cards for iid in c["关联素材"]}
         materials = [m for m in materials if m["item_id"] in used_ids]
+    # 防线：无论从 collect 还是 topics-round 进入，写 03 前都按引用素材做 X 隐私清洗。
+    mat_by_id = {m["item_id"]: m for m in materials}
+    for card in cards:
+        cited = [mat_by_id[iid] for iid in card.get("关联素材") or []
+                 if iid in mat_by_id]
+        if cited:
+            sanitize_card(card, cited)
     n_mat = 0
     for it in materials:
         client.upsert_row(db_ids["01_原始素材"], "item_id", it["item_id"],
@@ -336,6 +344,7 @@ def step_write_topics(client, db_ids, cards: list[dict],
             "副业证据等级": rt(_pending(c.get("副业证据等级"))),
             "传播潜力假设(不计分)": rt(_pending(
                 c.get("传播潜力假设(不计分)") or c.get("传播潜力假设"))),
+            "生成引擎": rt(c.get("生成引擎") or "启发式"),
         }
         props = {k: v for k, v in props.items() if k in schema}
         writer = client.create_row_if_absent if create_only else client.upsert_row

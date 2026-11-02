@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from src.analysis.classify import classify_item
 from src.analysis.demand import short_evidence_texts
+from src.analysis.privacy import keyword_summary
 from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,
                                   score_item, score_item_v3)
 
@@ -62,7 +63,9 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
     for i, d in enumerate(details[:top_k], start=1):
         it, sc, ctype = d["item"], d["score"], d["content_type"]
         v3 = d["v3"]
-        title_tpl, platform = TYPE_TEMPLATES[ctype]
+        _title_tpl, platform = TYPE_TEMPLATES[ctype]
+        # 启发式标题只用「类型｜关键词概括」，绝不截断帖子/素材原文。
+        title = f"{ctype}｜{keyword_summary(it, ctype)}"
         weak = sorted(sc["dimensions"], key=lambda x: x["points"])[:2]
         weakest_txt = "；".join(f"{w['name']}({w['grade']}：{w['reason']})" for w in weak)
         strong = next(x for x in sc["dimensions"] if x["name"] == "信息可信度")
@@ -79,7 +82,7 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
                            f"仅假设「{audience}」关心此类内容，须在文案阶段或评论区补证")
         cards.append({
             "topic_id": f"T-{now.strftime('%Y%m%d')}-{i:03d}",
-            "拟定标题": title_tpl.format(title=(it.get("title_or_summary") or "")[:60]),
+            "拟定标题": title,
             "建议平台": platform,
             "面向谁": f"{audience}；他们想解决：{_audience_problem(ctype)}",
             "核心价值": f"用一条内容讲清「{ctype}」：{(it.get('title_or_summary') or '')[:50]}",
