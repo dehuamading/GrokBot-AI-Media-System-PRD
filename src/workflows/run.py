@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.analysis.audience import load_profile  # noqa: E402
 from src.analysis.scoring import SCORING_VERSION  # noqa: E402
+from src.cost_log import UNKNOWN, append_cost  # noqa: E402
 from src.llm.base import DraftClient  # noqa: E402
 from src.llm.template_client import TemplateClient  # noqa: E402
 from src.normalize import iso_now  # noqa: E402
@@ -43,6 +44,68 @@ def make_llm(name: str) -> DraftClient:
         from src.llm.openai_compat import OpenAICompatClient
         return OpenAICompatClient()  # 未配置环境变量时抛 LLMNotConfigured
     raise ValueError(f"未知 LLM 引擎：{name}")
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _serving_label(chat, analyze_mode: str) -> tuple[str, str]:
+    """返回实际服务的 (provider, model)；不打印/记录任何密钥。"""
+    if chat is None:
+        return "heuristic", SCORING_VERSION
+    if analyze_mode == "llm":
+        return (getattr(chat, "last_provider", "未调用"),
+                getattr(chat, "last_model", "未调用"))
+    return "glm", getattr(chat, "model", "未知")
+
+
+def _aggregate_usage(chat) -> dict:
+    """汇总 usage_log；任何无法确认的 token/金额都写“未知”，绝不以 0 代替。"""
+    usage = getattr(chat, "usage_log", []) or []
+    calls = getattr(chat, "calls", 0)
+    if not usage:
+        return {"calls": calls, "prompt_tokens": UNKNOWN,
+                "completion_tokens": UNKNOWN, "tokens": UNKNOWN, "cost": UNKNOWN}
+
+    prompts = [u.get("prompt_tokens") for u in usage]
+    completions = [u.get("completion_tokens") for u in usage]
+    costs = [u.get("cost") for u in usage]
+    if all(_is_number(v) for v in prompts) and all(_is_number(v) for v in completions):
+        prompt_tokens = sum(prompts)
+        completion_tokens = sum(completions)
+        tokens = prompt_tokens + completion_tokens
+    else:
+        prompt_tokens = completion_tokens = tokens = UNKNOWN
+    cost = sum(costs) if all(_is_number(v) for v in costs) else UNKNOWN
+    return {"calls": calls, "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens, "tokens": tokens, "cost": cost}
+
+
+def _log_collect_cost(args, out: dict, chat, analyze_mode: str) -> dict:
+    path = Path(args.state).parent / "cost_log.jsonl"
+    if chat is None:
+        stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                 "tokens": 0, "cost": 0}
+        provider, model = "heuristic", SCORING_VERSION
+    else:
+        stats = _aggregate_usage(chat)
+        provider, model = _serving_label(chat, analyze_mode)
+    external = out.get("external_calls")
+    if not isinstance(external, dict):
+        external = {"github": 0, "aihot": 1 if getattr(args, "live", False) else 0,
+                    "official": 0, "x": 0}
+    record = append_cost(path, {
+        "command": f"collect --analyze {analyze_mode}",
+        "provider": provider,
+        "model": model,
+        **stats,
+        "external_api_calls": external,
+    })
+    print(f"[成本] 实际服务 provider={record['provider']} model={record['model']}；"
+          f"调用 {record['calls']} 次，tokens={record['tokens']}，"
+          f"金额={record['金额']}")
+    return record
 
 
 def audit_event(client, db_ids, event_id, obj, op, ok, detail):
@@ -78,17 +141,27 @@ def cmd_collect(args) -> int:
         live=args.live, snapshot_dir=None if args.dry_run else "data/raw")
 
     analyze_meta = {"engine": f"heuristic:{SCORING_VERSION}"}
-    use_glm = (getattr(args, "analyze", "heuristic") == "glm" and not args.dry_run)
-    if use_glm:
-        from src.llm.glm import GLMChat
-        chat = GLMChat()  # 需 GLM_API_BASE/GLM_API_KEY 环境变量；缺则报错退出
+    analyze_mode = getattr(args, "analyze", "heuristic")
+    chat = None
+    use_llm = (analyze_mode in ("glm", "llm") and not args.dry_run)
+    if use_llm:
+        if analyze_mode == "glm":
+            from src.llm.glm import GLMChat
+            chat = GLMChat()  # 需 GLM_API_BASE/GLM_API_KEY 环境变量；缺则报错退出
+        else:
+            from src.llm.provider_chain import ProviderChain
+            chat = ProviderChain()  # OpenCode Go → GLM → DeepSeek；缺失的提供方自动跳过
         short = llm_topics.shortlist(out["materials"], k=args.shortlist, profile=profile)
         glm_scores = llm_topics.glm_score_posts(chat, short, profile)
         cards, meta = llm_topics.glm_build_cards(chat, short, profile,
                                                  glm_scores=glm_scores)
+        provider, model = _serving_label(chat, analyze_mode)
         analyze_meta = {"engine": meta["engine"], "glm_calls": meta["glm_calls"],
                         "shortlist": len(short), "scored": len(glm_scores),
-                        "dropped_cards": meta["dropped"]}
+                        "dropped_cards": meta["dropped"],
+                        "provider": provider, "model": model}
+        if analyze_mode == "llm":
+            analyze_meta["engine"] = f"llm:{provider}/{model}"
         details = []
         used = {iid for c in cards for iid in c["关联素材"]}
         for m in out["materials"]:
@@ -101,8 +174,8 @@ def cmd_collect(args) -> int:
             m["processing_status"] = "candidate"
         ana = {"cards": cards, "details": details}
     else:
-        if getattr(args, "analyze", "heuristic") == "glm":
-            print("[dry-run] glm 分析不真实调用（省 token），回退启发式展示")
+        if analyze_mode in ("glm", "llm"):
+            print(f"[dry-run] {analyze_mode} 分析不真实调用（省 token），回退启发式展示")
         ana = pipeline.step_analyze(state if not args.dry_run else dry,
                                     out["materials"], top_k=args.top_k,
                                     profile=profile)
@@ -111,14 +184,20 @@ def cmd_collect(args) -> int:
           f"{'真实拉取' if args.live else '离线回放'}；X 帖子文件 {out['x_posts']} 条；"
           f"X 账号 {len(out['accounts'])} 个（仅文件）")
     print(f"[S2] 分析引擎：{analyze_meta['engine']}；选题卡 {len(ana['cards'])} 张"
-          + (f"（GLM 调用 {analyze_meta['glm_calls']} 次，候选 {analyze_meta['shortlist']} 条）"
+          + (f"（{('LLM' if analyze_mode == 'llm' else 'GLM')} 调用 "
+             f"{analyze_meta['glm_calls']} 次，候选 {analyze_meta['shortlist']} 条）"
              if 'glm_calls' in analyze_meta else
              f"（评分版本 {SCORING_VERSION}，推荐 "
              f"{sum(1 for c in ana['cards'] if c['推荐级别'] == '推荐')} / "
              f"备选 {sum(1 for c in ana['cards'] if c['推荐级别'] == '备选')} / "
              f"观察 {sum(1 for c in ana['cards'] if c['推荐级别'] == '观察')}）"))
+    if use_llm:
+        provider, model = _serving_label(chat, analyze_mode)
+        print(f"[LLM] 本次实际服务 provider/model：{provider} / {model}")
     if len(ana["cards"]) < 5:
         print(f"⚠️ 选题卡不足 5 张（{len(ana['cards'])}），仍按规则写入并标记 insufficient")
+    if not args.dry_run:
+        _log_collect_cost(args, out, chat, analyze_mode)
 
     if args.dry_run:
         print("[dry-run] 未写 Notion、未落状态。前 3 张卡：")
@@ -308,8 +387,9 @@ def main() -> int:
     p.add_argument("--live", action="store_true", help="真实拉取 aihot（≤20 条，默认离线回放）")
     p.add_argument("--audience", default="config/audience_profile.yaml",
                    help="受众画像 YAML（评分依据，任务05）")
-    p.add_argument("--analyze", default="heuristic", choices=["heuristic", "glm"],
-                   help="分析引擎：heuristic 本地启发式；glm 用户自备 GLM 套餐")
+    p.add_argument("--analyze", default="heuristic", choices=["heuristic", "glm", "llm"],
+                   help="分析引擎：heuristic 本地启发式；glm 用户自备 GLM 套餐；"
+                        "llm 走 OpenCode Go→GLM→DeepSeek 回退链")
     p.add_argument("--shortlist", type=int, default=60,
                    help="glm 路径的本地预筛候选数（控成本）")
     p.add_argument("--top-k", type=int, default=8)
