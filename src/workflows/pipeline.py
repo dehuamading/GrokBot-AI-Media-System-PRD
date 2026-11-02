@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from src.analysis.classify import classify_item
@@ -199,17 +200,35 @@ def step_analyze(state, materials: list[dict], top_k: int = 8,
 
 
 # ---------------------------------------------------------------------- S3
-def _material_notion_properties(it: dict, *, extended: bool = False) -> dict:
+def _safe_x_summary(it: dict, override=None) -> str:
+    """01 中 X 素材只写 LLM/规则概括：≤40 字，且不含 @handle/用户名。"""
+    from src.analysis.privacy import (keyword_summary, scrub_identifiers,
+                                      x_identifiers)
+    text = str(override or "").strip()
+    if not text or text in ("待验证", "未知", "待核实"):
+        text = keyword_summary(it)
+    text = scrub_identifiers(text, x_identifiers([it]))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 40:
+        text = text[:40].rstrip()
+    return text or "X帖子｜AI行业动态"
+
+
+def _material_notion_properties(it: dict, *, extended: bool = False,
+                                summary_override: str | None = None) -> dict:
     from src.notion_store.client import (date_prop, number_prop, rt,
                                          select_prop, url_prop)
     extra = it.get("extra") or {}
+    title_or_summary = it["title_or_summary"]
+    if it.get("source_type") == "x_posts":
+        title_or_summary = _safe_x_summary(it, summary_override)
     props = {
         "source_type": select_prop(it["source_type"]),
         "source_url": url_prop(it["source_url"]),
         "author_or_publisher": rt(it["author_or_publisher"]),
         "published_at": date_prop(it["published_at"]),
         "collected_at": date_prop(it["collected_at"]),
-        "title_or_summary": rt(it["title_or_summary"]),
+        "title_or_summary": rt(title_or_summary),
         "claims": rt(" | ".join(c for c in it.get("claims") or [] if c)),
         "evidence_status": select_prop(it["evidence_status"]),
         "processing_status": select_prop(it["processing_status"]),
@@ -298,60 +317,130 @@ def step_write_topics(client, db_ids, cards: list[dict],
                  if iid in mat_by_id]
         if cited:
             sanitize_card(card, cited)
+    summary_by_item: dict[str, str] = {}
+    for card in cards:
+        for iid in card.get("关联素材") or []:
+            summary_by_item.setdefault(iid, card.get("拟定标题") or "")
     n_mat = 0
     for it in materials:
         client.upsert_row(db_ids["01_原始素材"], "item_id", it["item_id"],
-                          _material_notion_properties(it))
+                          _material_notion_properties(
+                              it, summary_override=summary_by_item.get(
+                                  it["item_id"])))
         n_mat += 1
 
     db_id = db_ids["03_选题决策"]
     schema = set((client.get_database(db_id).get("properties") or {}).keys())
     n_top = 0
     for c in cards:
-        # 原始来源必须是素材 source_url；缺失则不出卡（不编造来源）。
-        source_url = (c.get("原始来源")
-                      or ((c.get("_source_urls") or [None])[0]))
-        if not source_url:
+        props = _topic_card_properties(c, schema, include_user=True)
+        if not props:
             continue
-        linked = "、".join(f"{iid}" for iid in c["关联素材"])
-        props = {
-            "拟定标题": rt(c["拟定标题"]), "建议平台": select_prop(c["建议平台"]),
-            "面向谁": rt(c["面向谁"]), "核心价值": rt(c["核心价值"]),
-            "为什么现在": rt(c["为什么现在"]), "关联素材": rt(linked),
-            "需求证据": rt(c["需求证据"]), "可信度与风险": rt(c["可信度与风险"]),
-            "最强反证": rt(c["最强反证"]), "差异与难度": rt(c["差异与难度"]),
-            "推荐级别": select_prop(c["推荐级别"]), "推荐理由": rt(c["推荐理由"]),
-            "用户选择结果": select_prop("待用户选择"),
-            # 任务05 新增列（只增列升级，不存在时自动补）：
-            "为什么适合": rt(c.get("为什么适合")),
-            "切入角度与钩子": rt(c.get("切入角度与钩子")),
-            "国内可用性": rt(c.get("国内可用性")),
-            "引用帖子": rt(c.get("引用帖子")),
-            "综合评分": number_prop(c.get("综合评分")),
-            # 阶段3 新字段（列不存在时跳过该属性）
-            "选题类型": rt(_pending(c.get("选题类型") or c.get("类型"))),
-            "面向用户": rt(_pending(c.get("面向用户"))),
-            "痛点或机会": rt(_pending(c.get("痛点或机会"))),
-            "原始来源": url_prop(source_url),
-            "为何现在做": rt(_pending(c.get("为何现在做"))),
-            "国内可用": rt(_pending(c.get("国内可用"))),
-            "是否付费": rt(_pending(c.get("是否付费"))),
-            "能否实际验证": rt(_pending(c.get("能否实际验证"))),
-            "切入角度": rt(_pending(c.get("切入角度"))),
-            "主要风险": rt(_pending(c.get("主要风险"))),
-            "评分版本": rt(_pending(c.get("评分版本"))),
-            "轨道得分": number_prop(c.get("轨道得分")),
-            "副业证据等级": rt(_pending(c.get("副业证据等级"))),
-            "传播潜力假设(不计分)": rt(_pending(
-                c.get("传播潜力假设(不计分)") or c.get("传播潜力假设"))),
-            "生成引擎": rt(c.get("生成引擎") or "启发式"),
-        }
-        props = {k: v for k, v in props.items() if k in schema}
         writer = client.create_row_if_absent if create_only else client.upsert_row
         writer(db_id, "topic_id", c["topic_id"], props)
         n_top += 1
     return {"materials_written": n_mat, "topics_written": n_top,
             "materials_total": len(materials)}
+
+
+def _topic_card_properties(card: dict, schema: set[str], *,
+                           include_user: bool = False) -> dict:
+    """组装 03 属性；repair 时 include_user=False，绝不覆盖用户选择结果。"""
+    from src.notion_store.client import (number_prop, rt, select_prop,
+                                         url_prop)
+    # 原始来源必须是素材 source_url；缺失则不出卡（不编造来源）。
+    source_url = (card.get("原始来源")
+                  or ((card.get("_source_urls") or [None])[0]))
+    if not source_url:
+        return {}
+    linked = "、".join(f"{iid}" for iid in card["关联素材"])
+    props = {
+        "拟定标题": rt(card["拟定标题"]), "建议平台": select_prop(card["建议平台"]),
+        "面向谁": rt(card["面向谁"]), "核心价值": rt(card["核心价值"]),
+        "为什么现在": rt(card["为什么现在"]), "关联素材": rt(linked),
+        "需求证据": rt(card["需求证据"]), "可信度与风险": rt(card["可信度与风险"]),
+        "最强反证": rt(card["最强反证"]), "差异与难度": rt(card["差异与难度"]),
+        "推荐级别": select_prop(card["推荐级别"]), "推荐理由": rt(card["推荐理由"]),
+        # 任务05 新增列（只增列升级，不存在时自动补）：
+        "为什么适合": rt(card.get("为什么适合")),
+        "切入角度与钩子": rt(card.get("切入角度与钩子")),
+        "国内可用性": rt(card.get("国内可用性")),
+        "引用帖子": rt(card.get("引用帖子")),
+        "综合评分": number_prop(card.get("综合评分")),
+        # 阶段3 新字段（列不存在时跳过该属性）
+        "选题类型": rt(_pending(card.get("选题类型") or card.get("类型"))),
+        "面向用户": rt(_pending(card.get("面向用户"))),
+        "痛点或机会": rt(_pending(card.get("痛点或机会"))),
+        "原始来源": url_prop(source_url),
+        "为何现在做": rt(_pending(card.get("为何现在做"))),
+        "国内可用": rt(_pending(card.get("国内可用"))),
+        "是否付费": rt(_pending(card.get("是否付费"))),
+        "能否实际验证": rt(_pending(card.get("能否实际验证"))),
+        "切入角度": rt(_pending(card.get("切入角度"))),
+        "主要风险": rt(_pending(card.get("主要风险"))),
+        "评分版本": rt(_pending(card.get("评分版本"))),
+        "轨道得分": number_prop(card.get("轨道得分")),
+        "副业证据等级": rt(_pending(card.get("副业证据等级"))),
+        "传播潜力假设(不计分)": rt(_pending(
+            card.get("传播潜力假设(不计分)") or card.get("传播潜力假设"))),
+        "生成引擎": rt(card.get("生成引擎") or "启发式"),
+    }
+    if include_user:
+        props["用户选择结果"] = select_prop("待用户选择")
+    return {k: v for k, v in props.items() if k in schema}
+
+
+def _rich_or_title_text(prop: dict | None) -> str:
+    prop = prop or {}
+    for key in ("rich_text", "title"):
+        if prop.get(key):
+            return "".join(x.get("text", {}).get("content", "")
+                           for x in prop[key])
+    return ""
+
+
+def update_topics_by_ids(client, db_ids, cards: list[dict],
+                         allowed_ids: set[str] | list[str]) -> dict:
+    """repair 专用：只更新 allowed_ids 中已存在的 03 行，不新建/不删除。"""
+    allowed = set(allowed_ids)
+    db_id = db_ids["03_选题决策"]
+    schema = set((client.get_database(db_id).get("properties") or {}).keys())
+    updated, skipped = [], []
+    for card in cards:
+        topic_id = card.get("topic_id")
+        if topic_id not in allowed:
+            continue
+        props = _topic_card_properties(card, schema, include_user=False)
+        if not props:
+            skipped.append(topic_id)
+            continue
+        row_id = client.find_row_by_title(db_id, "topic_id", topic_id)
+        if not row_id:
+            skipped.append(topic_id)
+            continue
+        client.update_page(row_id, props)
+        updated.append(topic_id)
+    return {"updated": updated, "skipped": skipped,
+            "updated_count": len(updated)}
+
+
+def prefix_notion_title(client, db_ids, db_name: str, key_prop: str,
+                        key_value: str, value_prop: str, marker: str) -> bool:
+    """仅在目标行标题前加一次标记；不改其他字段、不新建行。"""
+    from src.notion_store.client import rt
+    db_id = db_ids[db_name]
+    row_id = client.find_row_by_title(db_id, key_prop, key_value)
+    if not row_id:
+        return False
+    current = ""
+    for row in client.query_database(db_id):
+        if row.get("id") == row_id:
+            current = _rich_or_title_text(row.get("properties", {}).get(value_prop))
+            break
+    if current.startswith(marker):
+        return False
+    client.update_page(row_id, {value_prop: rt(marker + current)})
+    return True
 
 
 def step_write_demands(client, db_ids, aggregates, *,

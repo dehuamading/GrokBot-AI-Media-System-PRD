@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 
 from src.analysis.audience import AudienceProfile, match_audience
 from src.analysis.demand import short_evidence_texts
+from src.analysis.fields import (audience_user, filled, normalize_china_usability,
+                                 paid_label)
 from src.analysis.scoring import SCORING_VERSION_V3, score_item_v3
 from src.llm.glm import GLMChat, GLMParseError
 
@@ -188,8 +190,14 @@ CARD_SYSTEM = (
     "5) platform ∈ {抖音,小红书,两者}；score 为你给的 0-10 综合分；\n"
     "6) 标题必须是中文概括改写，禁止照抄帖子原文（尤其禁止连续 >20 字原文），"
     "禁止写入作者显示名、username 或 @handle；引用链接由程序从素材注入；\n"
+    "7) 新字段必须尽量给出：target_user（从 AI普通使用者/AI内容创作者/"
+    "AI编程与应用开发者/AI副业与创业探索者/国外AI工具的国内使用者 中选最匹配项）、"
+    "pain_or_opportunity、why_now、angle、paid（是否付费）、verifiable（能否实际验证）；"
+    "确实不知道才写「待验证」，不得用空话；\n"
     '严格只输出 JSON：{"cards":[{"title":"…","why_fit":"…","hook":"…","refs":[1],'
-    '"china":"…","risk":"…","counter":"…","difficulty":"…","platform":"抖音","score":8}]}'
+    '"china":"…","risk":"…","counter":"…","difficulty":"…","platform":"抖音","score":8,'
+    '"target_user":"…","pain_or_opportunity":"…","why_now":"…","angle":"…",'
+    '"paid":"…","verifiable":"…"}]}'
 )
 
 
@@ -238,12 +246,14 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
     if data is None:
         raise last_err
 
+    service_label = _service_label(chat)
     cards, dropped = [], []
     seen_titles: set[str] = set()
     for raw in (data.get("cards") or [])[: max_cards + 4]:
         card, why_drop = _assemble_card(raw, by_n, profile, now,
                                         glm_scores or {}, len(cards) + 1,
-                                        default_type=card_type)
+                                        default_type=card_type,
+                                        service_label=service_label)
         if card is None:
             dropped.append(why_drop)
             continue
@@ -266,9 +276,19 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
     return cards, meta
 
 
+def _service_label(chat) -> str:
+    """实际服务 provider/model；优先 provider_chain 的 last_provider/last_model。"""
+    provider = (getattr(chat, "last_provider", None)
+                or getattr(chat, "provider", None) or "llm")
+    model = (getattr(chat, "last_model", None)
+             or getattr(chat, "model", None) or "unknown")
+    return f"{provider}/{model}"
+
+
 def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
                    now: datetime, glm_scores: dict, seq: int,
-                   default_type: str | None = None) -> tuple[dict | None, str]:
+                   default_type: str | None = None,
+                   service_label: str = "llm") -> tuple[dict | None, str]:
     """把 LLM 原始卡组装为完整卡片；字段缺失/引用非法 → (None, 丢弃原因)。"""
     title = str(raw.get("title") or "").strip()
     why = str(raw.get("why_fit") or "").strip()
@@ -335,6 +355,7 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
     reasons = [r for r in reasons if r]
     latest = max((m.get("published_at") or "" for m in mats), default="")
     eng_total = sum(_engagement(m) for m in mats)
+    primary_text = " ".join(str(m.get("title_or_summary") or "") for m in mats)
 
     why_now = f"来源帖子发布于近 24 小时窗口（最新 {latest or '待验证'}）；引用帖合计互动（赞+转+评+引）约 {eng_total}"
     demand_text = ("评论证据（脱敏，≤3条）："
@@ -354,15 +375,16 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         "可信度与风险": f"{risk}；证据等级 self_reported（X 帖子为作者自述，引用前须打开原帖核验）",
         "最强反证": counter,
         "差异与难度": str(raw.get("difficulty") or "待核实"),
-        "推荐级别": "推荐" if score >= 8 else ("备选" if score >= 6 else "观察"),
-        "推荐理由": f"GLM 综合评分 {score}/10（画像 {profile.profile_id}）："
-                  + ("；".join(reasons) or "GLM 未给逐条理由"),
+        "推荐级别": v3["level"],
+        "推荐理由": f"{service_label} 综合评分 {score}/10（画像 {profile.profile_id}）："
+                  + ("；".join(reasons) or "未给逐条理由"),
         "内容类型": "LLM选题",
-        "综合评分": score,
+        "综合评分": v3["total"],
         "为什么适合": why,
         "切入角度与钩子": hook,
-        # 内部审计字段：最终推荐级别会同时参考 LLM 分数（不改变 v3 阈值）。
+        # 内部审计字段：LLM 分只作文字参考，最终级别只按 v3-dual。
         "_llm_score": score,
+        "_llm_service": service_label,
         "_llm_level": "推荐" if score >= 8 else ("备选" if score >= 6 else "观察"),
         "国内可用性": china,
         "引用帖子": cited,
@@ -370,16 +392,19 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         # 阶段3 新字段（只增不改旧字段；空/未知统一「待验证」）
         "类型": chosen_type,
         "选题类型": chosen_type,
-        "面向用户": _pending(raw.get("target_user")) or
-                  f"{profile.name}（画像 {profile.profile_id}）",
-        "痛点或机会": _pending(raw.get("pain_or_opportunity")) or why,
+        "面向用户": audience_user(
+            filled(raw.get("target_user")) or
+            f"{profile.name}（画像 {profile.profile_id}）",
+            title, why, hook, primary_text),
+        "痛点或机会": filled(raw.get("pain_or_opportunity")) or why,
         "原始来源": source_urls[0],
-        "为何现在做": _pending(raw.get("why_now")) or why_now,
-        "国内可用": _pending(raw.get("china")) or china,
-        "是否付费": _pending(raw.get("paid")),
-        "能否实际验证": _pending(raw.get("verifiable")) or
+        "为何现在做": filled(raw.get("why_now")) or why_now,
+        "国内可用": normalize_china_usability(
+            filled(raw.get("china")) or china),
+        "是否付费": filled(raw.get("paid")) or paid_label(primary_text),
+        "能否实际验证": filled(raw.get("verifiable")) or
                     ("可验证：有原始出处链接" if source_urls else "待验证"),
-        "切入角度": _pending(raw.get("angle")) or hook,
+        "切入角度": filled(raw.get("angle")) or hook,
         "主要风险": risk,
         "评分版本": SCORING_VERSION_V3,
         "轨道得分": v3["track_score"],

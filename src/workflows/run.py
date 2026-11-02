@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -28,6 +29,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.analysis.audience import load_profile  # noqa: E402
+from src.analysis.fields import (audience_user, filled,  # noqa: E402
+                                 is_simulated_source,
+                                 normalize_china_usability, paid_label)
 from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,  # noqa: E402
                                   merge_dual_tracks, score_item_v3)
 from src.connectors.github_source import (DEFAULT_SNAPSHOTS, fetch_github,  # noqa: E402
@@ -872,33 +876,46 @@ def _postprocess_round_cards(cards: list[dict], materials: list[dict], *,
         c["副业证据等级"] = v3["side_hustle_evidence_level"]
         c["传播潜力假设(不计分)"] = v3["propagation_hypothesis"]["text"]
         c["综合评分"] = v3["adjusted_total"]
-        # 推荐级别：v3 阈值保持不变；LLM 评分≥8 的卡也可明确列为“推荐”，
-        # 并在理由中透明标注两套信号，避免启发式系统偏低时全部压在“备选”。
+        # 最终推荐级别只按 v3-dual；LLM 分只作为推荐理由中的文字参考。
         llm_score = c.get("_llm_score")
-        level = v3["level"]
-        llm_reason = ""
-        if _is_number(llm_score) and llm_score >= 8:
-            level = "推荐"
-            llm_reason = f"LLM 综合评分 {llm_score}/10（≥8）→ 推荐"
-        c["推荐级别"] = level
+        c["推荐级别"] = v3["level"]
         base_reason = str(c.get("推荐理由") or "").strip()
-        v3_reason = (f"v3 总分 {v3['adjusted_total']}/18，轨道分 "
+        v3_reason = (f"v3 总分 {v3['adjusted_total']}/18（满分 18），轨道分 "
                      f"{v3['adjusted_track_score']}")
         if v3["rule_adjustment"]:
             v3_reason += f"（已应用正在使用规则加减分 {v3['rule_adjustment']:+d}）"
-        if llm_reason:
-            v3_reason += "；" + llm_reason
+        llm_ref = ""
+        if _is_number(llm_score) and f"{llm_score}/10" not in base_reason:
+            service = c.get("_llm_service") or "LLM"
+            llm_ref = f"LLM 参考分（{service}）：{llm_score}/10（不参与推荐级别）"
+        if llm_ref:
+            v3_reason += "；" + llm_ref
         c["推荐理由"] = (base_reason + "；" + v3_reason
                          if base_reason else v3_reason)
-        c["面向用户"] = c.get("面向用户") or c.get("面向谁") or "待验证"
-        c["痛点或机会"] = c.get("痛点或机会") or c.get("核心价值") or "待验证"
+        material_text = " ".join(
+            str(m.get("title_or_summary") or "") for m in mats)
+        old_audience = filled(c.get("面向谁"))
+        c["面向用户"] = audience_user(
+            old_audience or filled(c.get("面向用户")) or "待验证",
+            c.get("拟定标题"), c.get("核心价值"), c.get("为什么适合"),
+            material_text)
+        c["痛点或机会"] = (filled(c.get("痛点或机会"))
+                           or filled(c.get("为什么适合"))
+                           or filled(c.get("核心价值")) or "待验证")
         c["原始来源"] = source_urls[0]
-        c["为何现在做"] = c.get("为何现在做") or c.get("为什么现在") or "待验证"
-        c["国内可用"] = c.get("国内可用") or c.get("国内可用性") or "待验证"
-        c["是否付费"] = c.get("是否付费") or "待验证"
-        c["能否实际验证"] = c.get("能否实际验证") or "待验证"
-        c["切入角度"] = c.get("切入角度") or c.get("切入角度与钩子") or "待验证"
-        c["主要风险"] = c.get("主要风险") or c.get("可信度与风险") or "待验证"
+        c["为何现在做"] = (filled(c.get("为何现在做"))
+                           or filled(c.get("为什么现在")) or "待验证")
+        c["国内可用"] = normalize_china_usability(
+            filled(c.get("国内可用")) or filled(c.get("国内可用性")))
+        c["是否付费"] = (filled(c.get("是否付费"))
+                         or paid_label(material_text))
+        c["能否实际验证"] = (filled(c.get("能否实际验证"))
+                             or ("可验证：有原始出处链接"
+                                 if source_urls else "待验证"))
+        c["切入角度"] = (filled(c.get("切入角度"))
+                         or filled(c.get("切入角度与钩子")) or "待验证")
+        c["主要风险"] = (filled(c.get("主要风险"))
+                         or filled(c.get("可信度与风险")) or "待验证")
         c["引用帖子"] = "；".join(source_urls)  # X 卡只放 url，不写用户名/正文全文
         c.setdefault("生成引擎", "启发式")
         c["_source_urls"] = source_urls
@@ -912,108 +929,16 @@ def _postprocess_round_cards(cards: list[dict], materials: list[dict], *,
     return merged
 
 
-def cmd_topics_round(args, *, client=None, chat=None, profile=None,
-                     now: datetime | None = None) -> int:
-    """选题轮：采集→需求分类→偏好注入→LLM/启发式出卡→v3 校验→写 03/02→停 GATE-1。"""
+def _generate_round_cards(args, out, *, chat, profile, now, preference_text,
+                          active_rules):
+    """采集结果 → 需求分类 → shortlist → LLM/启发式出卡 → v3 后处理。"""
     from src.analysis import demand as demand_engine
-    from src.analysis import llm_topics, preference
-    from src.analysis.topics import build_topic_cards
-    from src.connectors.x_posts_source import load_x_posts
+    from src.analysis import llm_topics
 
-    now = now or datetime.now(timezone.utc)
-    round_id = str(getattr(args, "round_id", None) or now.strftime("%Y%m%d%H%M%S"))
-    dry = bool(getattr(args, "dry_run", False))
-    state = _DryState(args.state) if dry else WorkflowState(args.state)
-    if not dry:
-        state.load()
-    if profile is None and getattr(args, "audience", None):
-        profile = load_profile(args.audience)
-    analyze_mode = getattr(args, "analyze", "llm")
-    # dry-run 只禁止“写”，不禁止读/LLM；默认 llm 必须真正走 provider_chain。
-    if chat is None and analyze_mode == "llm":
-        try:
-            from src.llm.provider_chain import ProviderChain
-            chat = ProviderChain()
-        except Exception as exc:  # noqa: BLE001 - 未配置时回退启发式
-            print(f"⚠️ LLM 未配置，回退启发式：{type(exc).__name__}: {exc}")
-            chat = None
-    if profile is None and chat is not None:
-        profile = load_profile()
-
-    # 1) 偏好：先读 05，供需求分类/打分/出卡注入；全文落本地 state 目录。
-    # dry-run 只要有 NOTION_TOKEN + 已知 db_ids，也要只读加载（绝不建库/改列）。
-    prefs = {"approved": [], "rejected": [], "rules": [], "candidate_rules": []}
-    db_ids = state.get("db_ids")
-    if dry and not db_ids and Path(args.state).exists():
-        persisted = WorkflowState(args.state).load()
-        db_ids = persisted.get("db_ids")
-    if client is None and os.environ.get("NOTION_TOKEN") and (not dry or db_ids):
-        try:
-            client = NotionClient()
-        except Exception as exc:  # noqa: BLE001 - 无 token/权限时仍可本地预览
-            print(f"⚠️ Notion 只读偏好不可用：{type(exc).__name__}: {exc}")
-    if client is not None:
-        if db_ids is None and not dry:
-            db_ids = ensure_kb(client, args.page_id)
-        elif db_ids is None and dry:
-            # dry-run 允许只读发现已有库，绝不建库/改列。
-            try:
-                found = client.child_databases(args.page_id)
-                db_ids = ({name: found[name] for name in
-                           ("00_X关注账号名单", "01_原始素材", "02_用户需求",
-                            "03_选题决策", "04_文案与版本", "05_经验与复盘",
-                            "08_维护与审计") if name in found} or None)
-            except Exception as exc:  # noqa: BLE001 - 只读发现失败不阻塞预览
-                print(f"⚠️ dry-run 只读发现 db_ids 失败：{type(exc).__name__}: {exc}")
-        if db_ids and db_ids.get("05_经验与复盘"):
-            if not dry:
-                ensure_kb_upgrades(client, db_ids)
-            state.update(db_ids=db_ids, page_root=args.page_id)
-            prefs = preference.load_recent_preferences(client, db_ids)
-            print(f"[偏好] 只读加载 05：认可 {len(prefs.get('approved') or [])} 条 / "
-                  f"否决 {len(prefs.get('rejected') or [])} 条 / "
-                  f"正在使用规则 {len(prefs.get('rules') or [])} 条")
-        elif dry:
-            print("[偏好] dry-run 未找到 05 db_id：跳过只读加载（不写 Notion）")
-    elif dry:
-        print("[偏好] dry-run 无 NOTION_TOKEN：跳过 05 只读加载（不写 Notion）")
-    preference_text = (preference.build_preference_prompt(prefs)
-                       if any(prefs.get(k) for k in
-                              ("approved", "rejected", "rules", "candidate_rules"))
-                       else "")
-    active_rules = [str(r.get("内容") or r.get("原始选题") or "").strip()
-                    for r in (prefs.get("rules") or [])
-                    if str(r.get("内容") or r.get("原始选题") or "").strip()]
-    injection_path = _write_preference_injection(
-        Path(args.state).parent, preference_text, now)
-    if preference_text:
-        print("[偏好] 注入前 800 字：")
-        print(preference_text[:800])
-    else:
-        print("[偏好] 本轮无历史偏好注入")
-    print(f"[偏好] 全文已保存：{injection_path}")
-
-    # 2) 采集 + 校验/过滤（x-replies-file 用现有 x_posts_source 加载）
-    x_replies = getattr(args, "x_replies_file", None)
-    x_loader = ((lambda p: load_x_posts(p, replies_path=x_replies))
-                if x_replies else load_x_posts)
-    out = pipeline.step_collect(
-        state, aihot_file=getattr(args, "aihot_file", None),
-        x_following_file=getattr(args, "x_following", None),
-        x_posts_file=getattr(args, "x_file", None),
-        live=getattr(args, "live", False),
-        snapshot_dir=None if dry else "data/raw",
-        sources=getattr(args, "sources", "aihot,github,official,x"),
-        github_top=getattr(args, "github_top", 5),
-        official_limit=getattr(args, "official_limit", 3),
-        aihot_limit=getattr(args, "aihot_limit", 20),
-        import_file=getattr(args, "import_file", None),
-        config_path=getattr(args, "config", None),
-        x_posts_loader=x_loader)
     materials = pipeline.eligible_materials(out["materials"])
-
-    # 3) 需求分类（LLM 失败回退关键词）；--analyze heuristic 时不得调用 LLM。
+    analyze_mode = getattr(args, "analyze", "llm")
     use_llm = analyze_mode == "llm" and chat is not None
+    # 3) 需求分类（LLM 失败回退关键词）；--analyze heuristic 时不得调用 LLM。
     flat = _flatten_demand_comments(materials)
     classified = demand_engine.classify_demands(
         flat, chat=chat if use_llm else None,
@@ -1149,12 +1074,395 @@ def cmd_topics_round(args, *, client=None, chat=None, profile=None,
                 merged = merge_dual_tracks(
                     merged + extra, top_n=max_cards,
                     opportunity_sources=OPPORTUNITY_SOURCES)
+    return merged, materials, classified, aggregates
+
+
+MARKER_SIMULATED = "[模拟样例·请忽略]"
+
+
+def _round_record_path(args, round_id: str) -> Path:
+    safe = str(round_id or "repair").replace("/", "_").replace(os.sep, "_")
+    return Path(args.state).parent / f"topics_round_{safe}.json"
+
+
+def _save_round_record(args, round_id: str, cards: list[dict],
+                       materials: list[dict], out: dict) -> Path:
+    used_ids = {iid for c in cards for iid in c.get("关联素材") or []}
+    by_id = {m["item_id"]: m for m in materials}
+    path = _round_record_path(args, round_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "round_id": round_id,
+        "saved_at": iso_now(),
+        "topic_ids": [c["topic_id"] for c in cards],
+        "cards": cards,
+        "material_ids": sorted(used_ids),
+        "materials": [
+            {"item_id": iid,
+             "source_type": by_id[iid].get("source_type"),
+             "source_url": by_id[iid].get("source_url")}
+            for iid in sorted(used_ids) if iid in by_id
+        ],
+        "sources": out.get("sources") or [],
+        "external_calls": out.get("external_calls") or {},
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    print(f"[轮次存档] 已保存 {path}")
+    return path
+
+
+def _load_round_record(args, round_id: str | None) -> dict | None:
+    if not round_id:
+        return None
+    path = _round_record_path(args, round_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _repair_id_list(record: dict | None, args) -> list[str]:
+    ids: list[str] = []
+    if record:
+        ids.extend(str(t) for t in (record.get("topic_ids") or []) if t)
+        if not ids:
+            ids.extend(str(c.get("topic_id")) for c in
+                       (record.get("cards") or []) if c.get("topic_id"))
+    raw = getattr(args, "repair_ids", None)
+    if raw:
+        if isinstance(raw, str):
+            raw = re.split(r"[,，\s]+", raw)
+        ids.extend(str(t).strip() for t in raw if str(t).strip())
+    out: list[str] = []
+    seen: set[str] = set()
+    for topic_id in ids:
+        if topic_id not in seen:
+            out.append(topic_id)
+            seen.add(topic_id)
+    return out
+
+
+def _prop_text(prop: dict | None) -> str:
+    prop = prop or {}
+    for key in ("title", "rich_text"):
+        if prop.get(key):
+            return "".join(x.get("text", {}).get("content", "")
+                           for x in prop[key])
+    return str(prop.get("url") or prop.get("select", {}).get("name", "") or "")
+
+
+def _existing_material_sources(client, db_ids, candidate_ids: set[str]) -> dict:
+    """从 01 查询候选素材的 source_url（用于 fallback repair 判断 example 域名）。"""
+    if client is None or not db_ids or not db_ids.get("01_原始素材"):
+        return {}
+    found: dict[str, str] = {}
+    for row in client.query_database(db_ids["01_原始素材"]):
+        props = row.get("properties") or {}
+        iid = _prop_text(props.get("item_id"))
+        if iid in candidate_ids:
+            found[iid] = _prop_text(props.get("source_url"))
+    return found
+
+
+def _round_simulated_sources(record: dict | None, client, db_ids,
+                             topic_ids: list[str]) -> tuple[set[str], set[str]]:
+    """返回 (需标记的 03 topic_id, 需标记的 01 item_id)。"""
+    fake_topics: set[str] = set()
+    fake_materials: set[str] = set()
+    wanted = set(topic_ids)
+    candidate_materials: set[str] = set()
+    linked_by_topic: dict[str, list[str]] = {}
+    source_by_topic: dict[str, str] = {}
+
+    if record:
+        material_info = {m.get("item_id"): m for m in
+                         (record.get("materials") or []) if m.get("item_id")}
+        candidate_materials.update(
+            str(i) for i in (record.get("material_ids") or []) if i)
+        for card in record.get("cards") or []:
+            tid = card.get("topic_id")
+            if tid not in wanted:
+                continue
+            linked = [str(i) for i in (card.get("关联素材") or [])]
+            linked_by_topic[tid] = linked
+            candidate_materials.update(linked)
+            if card.get("原始来源"):
+                source_by_topic[tid] = str(card.get("原始来源"))
+            urls = [card.get("原始来源")] + list(card.get("_source_urls") or [])
+            if any(is_simulated_source(None, u) for u in urls):
+                fake_topics.add(tid)
+    else:
+        if client and db_ids and db_ids.get("03_选题决策"):
+            for row in client.query_database(db_ids["03_选题决策"]):
+                props = row.get("properties") or {}
+                tid = _prop_text(props.get("topic_id"))
+                if tid not in wanted:
+                    continue
+                linked_text = _prop_text(props.get("关联素材"))
+                linked = [x for x in re.split(r"[、,，;；\s]+", linked_text) if x]
+                linked_by_topic[tid] = linked
+                candidate_materials.update(linked)
+                source_by_topic[tid] = _prop_text(props.get("原始来源"))
+
+    existing_sources = _existing_material_sources(
+        client, db_ids, candidate_materials)
+    for iid in candidate_materials:
+        recorded = (record or {}).get("materials") if record else None
+        recorded_url = ""
+        if recorded:
+            recorded_url = next(
+                (m.get("source_url") or "" for m in recorded
+                 if m.get("item_id") == iid), "")
+        if is_simulated_source(iid, recorded_url or existing_sources.get(iid)):
+            fake_materials.add(iid)
+
+    for tid, linked in linked_by_topic.items():
+        if (is_simulated_source(None, source_by_topic.get(tid))
+                or any(iid in fake_materials for iid in linked)):
+            fake_topics.add(tid)
+
+    # 旧存档若只有 material_ids 而没有卡内关联明细，无法逐卡映射：
+    # 该轮所有 topic_id 都视为受模拟素材影响（仍只限本轮）。
+    if record and fake_materials and not any(linked_by_topic.values()):
+        fake_topics.update(wanted)
+    return fake_topics, fake_materials
+
+
+def _mark_simulated_rows(client, db_ids, fake_topics: set[str],
+                         fake_materials: set[str]) -> dict:
+    marked_topics = [tid for tid in sorted(fake_topics)
+                     if pipeline.prefix_notion_title(
+                         client, db_ids, "03_选题决策", "topic_id", tid,
+                         "拟定标题", MARKER_SIMULATED)]
+    marked_materials = [iid for iid in sorted(fake_materials)
+                        if pipeline.prefix_notion_title(
+                            client, db_ids, "01_原始素材", "item_id", iid,
+                            "title_or_summary", MARKER_SIMULATED)]
+    return {"topics": marked_topics, "materials": marked_materials}
+
+
+def cmd_topics_round_repair(args, *, client=None, chat=None, profile=None,
+                            now: datetime | None = None) -> int:
+    """修复指定轮次：只更新该轮自建 topic_id 的 03 行，并标记模拟样例行。"""
+    from src.analysis import llm_topics  # noqa: F401 - 保持与 topics-round 同路径
+    from src.connectors.x_posts_source import load_x_posts
+
+    now = now or datetime.now(timezone.utc)
+    dry = bool(getattr(args, "dry_run", False))
+    round_id = getattr(args, "repair_round", None)
+    record = _load_round_record(args, round_id)
+    topic_ids = _repair_id_list(record, args)
+    if not topic_ids:
+        print("❌ repair 缺少 topic_id：本地无该轮存档时请显式传 "
+              "--repair-ids TX-...[,TX-...]")
+        return 1
+    print(f"[repair] 轮次 {round_id or '(未命名)'}：只更新 {len(topic_ids)} 个 topic_id "
+          f"（来源：{'本地存档' if record else '--repair-ids'}）")
+
+    state = _DryState(args.state) if dry else WorkflowState(args.state)
+    if not dry:
+        state.load()
+    if profile is None and getattr(args, "audience", None):
+        profile = load_profile(args.audience)
+    analyze_mode = getattr(args, "analyze", "llm")
+    if chat is None and analyze_mode == "llm":
+        try:
+            from src.llm.provider_chain import ProviderChain
+            chat = ProviderChain()
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ LLM 未配置，回退启发式：{type(exc).__name__}: {exc}")
+            chat = None
+    if profile is None and chat is not None:
+        profile = load_profile()
+
+    db_ids = state.get("db_ids")
+    if client is not None and db_ids is None:
+        db_ids = ensure_kb(client, args.page_id)
+    fake_topics, fake_materials = _round_simulated_sources(
+        record, client, db_ids, topic_ids)
+
+    x_replies = getattr(args, "x_replies_file", None)
+    x_loader = ((lambda p: load_x_posts(p, replies_path=x_replies))
+                if x_replies else load_x_posts)
+    aihot_file = getattr(args, "aihot_file", None)
+    live = bool(getattr(args, "live", True)) and not aihot_file
+    out = pipeline.step_collect(
+        state, aihot_file=aihot_file,
+        x_following_file=getattr(args, "x_following", None),
+        x_posts_file=getattr(args, "x_file", None),
+        live=live,
+        snapshot_dir=None if dry else "data/raw",
+        sources=getattr(args, "sources", "aihot,github,official,x"),
+        github_top=getattr(args, "github_top", 5),
+        official_limit=getattr(args, "official_limit", 3),
+        aihot_limit=getattr(args, "aihot_limit", 20),
+        import_file=getattr(args, "import_file", None),
+        config_path=getattr(args, "config", None),
+        x_posts_loader=x_loader)
+    merged, materials, classified, aggregates = _generate_round_cards(
+        args, out, chat=chat, profile=profile, now=now,
+        preference_text="", active_rules=[])
+    if not merged:
+        print("❌ repair 未生成任何可用新卡（真实素材不足或校验失败）；未更新 Notion。")
+        return 1
+    if len(merged) < len(topic_ids):
+        print(f"⚠️ 新卡 {len(merged)} 张少于待修复 topic_id {len(topic_ids)} 个："
+              "只更新有对应新卡的行，其余行保持原样。")
+    cards = merged[:len(topic_ids)]
+    for card, topic_id in zip(cards, topic_ids):
+        card["topic_id"] = topic_id
+
+    if getattr(args, "write_notion", False) and not dry:
+        client = client or NotionClient()
+        db_ids = db_ids or state.get("db_ids") or ensure_kb(client, args.page_id)
+        ensure_kb_upgrades(client, db_ids)
+        result = pipeline.update_topics_by_ids(client, db_ids, cards, topic_ids)
+        marked = _mark_simulated_rows(client, db_ids, fake_topics,
+                                       fake_materials)
+        print(f"[repair] 03 更新 {result['updated_count']} 行；跳过 "
+              f"{len(result['skipped'])} 行（不存在或缺少来源）")
+        print(f"[repair] 模拟样例标记：03 {len(marked['topics'])} 行 / "
+              f"01 {len(marked['materials'])} 行（已标记的不重复添加）")
+        if result["skipped"]:
+            print(f"[repair] 跳过 topic_id：{result['skipped']}")
+    else:
+        print("[repair] dry-run/未加 --write-notion：仅预览，不写 Notion。")
+        for card in cards:
+            print(f"  - {card['topic_id']} [{card.get('推荐级别')}] "
+                  f"{card.get('拟定标题')}")
+
+    _log_topics_round_cost(args, chat, out,
+                           demand_count=len(classified),
+                           card_count=len(cards))
+    print(f"✅ repair 完成：本轮 {len(cards)} 张；未删除任何行；"
+          "“用户选择结果”保持原值。")
+    return 0
+
+
+def cmd_topics_round(args, *, client=None, chat=None, profile=None,
+                     now: datetime | None = None) -> int:
+    """选题轮：采集→需求分类→偏好注入→LLM/启发式出卡→v3 校验→写 03/02→停 GATE-1。"""
+    from src.analysis import demand as demand_engine
+    from src.analysis import llm_topics, preference
+    from src.analysis.topics import build_topic_cards
+    from src.connectors.x_posts_source import load_x_posts
+
+    now = now or datetime.now(timezone.utc)
+    round_id = str(getattr(args, "round_id", None) or now.strftime("%Y%m%d%H%M%S"))
+    dry = bool(getattr(args, "dry_run", False))
+    provided_client = client is not None  # 测试注入的 mock 不触发真实写入护栏
+    state = _DryState(args.state) if dry else WorkflowState(args.state)
+    if not dry:
+        state.load()
+    if profile is None and getattr(args, "audience", None):
+        profile = load_profile(args.audience)
+    analyze_mode = getattr(args, "analyze", "llm")
+    # dry-run 只禁止“写”，不禁止读/LLM；默认 llm 必须真正走 provider_chain。
+    if chat is None and analyze_mode == "llm":
+        try:
+            from src.llm.provider_chain import ProviderChain
+            chat = ProviderChain()
+        except Exception as exc:  # noqa: BLE001 - 未配置时回退启发式
+            print(f"⚠️ LLM 未配置，回退启发式：{type(exc).__name__}: {exc}")
+            chat = None
+    if profile is None and chat is not None:
+        profile = load_profile()
+
+    # 1) 偏好：先读 05，供需求分类/打分/出卡注入；全文落本地 state 目录。
+    # dry-run 只要有 NOTION_TOKEN + 已知 db_ids，也要只读加载（绝不建库/改列）。
+    prefs = {"approved": [], "rejected": [], "rules": [], "candidate_rules": []}
+    db_ids = state.get("db_ids")
+    if dry and not db_ids and Path(args.state).exists():
+        persisted = WorkflowState(args.state).load()
+        db_ids = persisted.get("db_ids")
+    if client is None and os.environ.get("NOTION_TOKEN") and (not dry or db_ids):
+        try:
+            client = NotionClient()
+        except Exception as exc:  # noqa: BLE001 - 无 token/权限时仍可本地预览
+            print(f"⚠️ Notion 只读偏好不可用：{type(exc).__name__}: {exc}")
+    if client is not None:
+        if db_ids is None and not dry:
+            db_ids = ensure_kb(client, args.page_id)
+        elif db_ids is None and dry:
+            # dry-run 允许只读发现已有库，绝不建库/改列。
+            try:
+                found = client.child_databases(args.page_id)
+                db_ids = ({name: found[name] for name in
+                           ("00_X关注账号名单", "01_原始素材", "02_用户需求",
+                            "03_选题决策", "04_文案与版本", "05_经验与复盘",
+                            "08_维护与审计") if name in found} or None)
+            except Exception as exc:  # noqa: BLE001 - 只读发现失败不阻塞预览
+                print(f"⚠️ dry-run 只读发现 db_ids 失败：{type(exc).__name__}: {exc}")
+        if db_ids and db_ids.get("05_经验与复盘"):
+            if not dry:
+                ensure_kb_upgrades(client, db_ids)
+            state.update(db_ids=db_ids, page_root=args.page_id)
+            prefs = preference.load_recent_preferences(client, db_ids)
+            print(f"[偏好] 只读加载 05：认可 {len(prefs.get('approved') or [])} 条 / "
+                  f"否决 {len(prefs.get('rejected') or [])} 条 / "
+                  f"正在使用规则 {len(prefs.get('rules') or [])} 条")
+        elif dry:
+            print("[偏好] dry-run 未找到 05 db_id：跳过只读加载（不写 Notion）")
+    elif dry:
+        print("[偏好] dry-run 无 NOTION_TOKEN：跳过 05 只读加载（不写 Notion）")
+    preference_text = (preference.build_preference_prompt(prefs)
+                       if any(prefs.get(k) for k in
+                              ("approved", "rejected", "rules", "candidate_rules"))
+                       else "")
+    active_rules = [str(r.get("内容") or r.get("原始选题") or "").strip()
+                    for r in (prefs.get("rules") or [])
+                    if str(r.get("内容") or r.get("原始选题") or "").strip()]
+    injection_path = _write_preference_injection(
+        Path(args.state).parent, preference_text, now)
+    if preference_text:
+        print("[偏好] 注入前 800 字：")
+        print(preference_text[:800])
+    else:
+        print("[偏好] 本轮无历史偏好注入")
+    print(f"[偏好] 全文已保存：{injection_path}")
+
+    # 2) 采集 + 校验/过滤（x-replies-file 用现有 x_posts_source 加载）
+    x_replies = getattr(args, "x_replies_file", None)
+    x_loader = ((lambda p: load_x_posts(p, replies_path=x_replies))
+                if x_replies else load_x_posts)
+    aihot_file = getattr(args, "aihot_file", None)
+    live = bool(getattr(args, "live", True)) and not aihot_file
+    out = pipeline.step_collect(
+        state, aihot_file=aihot_file,
+        x_following_file=getattr(args, "x_following", None),
+        x_posts_file=getattr(args, "x_file", None),
+        live=live,
+        snapshot_dir=None if dry else "data/raw",
+        sources=getattr(args, "sources", "aihot,github,official,x"),
+        github_top=getattr(args, "github_top", 5),
+        official_limit=getattr(args, "official_limit", 3),
+        aihot_limit=getattr(args, "aihot_limit", 20),
+        import_file=getattr(args, "import_file", None),
+        config_path=getattr(args, "config", None),
+        x_posts_loader=x_loader)
+    merged, materials, classified, aggregates = _generate_round_cards(
+        args, out, chat=chat, profile=profile, now=now,
+        preference_text=preference_text, active_rules=active_rules)
     for i, c in enumerate(merged, start=1):
         c["topic_id"] = f"TX-{now.strftime('%Y%m%d')}-V{i:02d}"
         c["用户选择结果"] = "待用户选择"
 
+    used_material_ids = {iid for c in merged for iid in c.get("关联素材") or []}
+    offenders = [m for m in materials
+                 if is_simulated_source(m.get("item_id"), m.get("source_url"))]
+    # 真实 CLI 写入路径（client=None）绝不允许 fake/example 素材入 Notion；
+    # 测试注入 FakeNotionClient 与 dry-run 不受影响。
+    if getattr(args, "write_notion", False) and not dry and not provided_client and offenders:
+        print("❌ 拒绝写入 Notion：本轮引用了模拟样例来源（fake/example.com/example.org）。"
+              "请去掉 --aihot-file，使用真实 aihot 拉取或真实素材文件。")
+        for m in offenders[:5]:
+            print(f"  - {m.get('item_id')} ← {m.get('source_url') or '无 URL'}")
+        return 1
+    if not dry:
+        _save_round_record(args, round_id, merged, materials, out)
+
     print(f"[topics-round] 采集 {len(materials)} 条（去重丢弃 "
-          f"{len(out.get('dropped') or [])}）；评论 {len(flat)} 条；需求类 "
+          f"{len(out.get('dropped') or [])}）；评论 {len(classified)} 条；需求类 "
           f"{len(aggregates)} 类；合并选题卡 {len(merged)} 张")
     for c in merged:
         print(f"  - {c['topic_id']} [{c.get('选题类型')}/{c.get('推荐级别')}] "
@@ -1166,7 +1474,7 @@ def cmd_topics_round(args, *, client=None, chat=None, profile=None,
     if merged and level_counts.get("推荐", 0) == 0:
         print("[评分说明] 本轮无“推荐”：v3 九维启发式在缺少国内可用性/副业证据/"
               "可复现要素时，多个维度只能记 0/1，分数会系统性偏低；阈值（推荐≥12、"
-              "备选≥9、轨道分≥3）未为出推荐而调整。LLM 综合评分≥8 的卡会标为推荐。")
+              "备选≥9、轨道分≥3）未为出推荐而调整；LLM 分只作推荐理由中的文字参考。")
 
     # 5) 写 Notion（03 create_row_if_absent + 02 只增）→ 停 GATE-1
     if getattr(args, "write_notion", False) and not dry:
@@ -1338,17 +1646,22 @@ def main() -> int:
     p.add_argument("--x-replies-file", dest="x_replies_file", default=None,
                    help="X API 原样回复文件（data/includes/replies/meta）")
     p.add_argument("--x-following", dest="x_following", default=None)
-    p.add_argument("--aihot-file", dest="aihot_file",
-                   default="data/examples/aihot_fake_sample.json")
+    p.add_argument("--aihot-file", dest="aihot_file", default=None,
+                   help="显式传入才回放本地 aihot 文件；不传则默认真实拉取")
     p.add_argument("--import-file", default=None)
     p.add_argument("--github-top", type=int, default=5)
     p.add_argument("--aihot-limit", type=int, default=20)
     p.add_argument("--official-limit", type=int, default=3)
     p.add_argument("--max-cards", type=int, default=10)
     p.add_argument("--round-id", default=None)
+    p.add_argument("--repair-round", default=None,
+                   help="修复指定轮次：读取 data/state/topics_round_<id>.json")
+    p.add_argument("--repair-ids", default=None,
+                   help="本地无轮次存档时显式传 topic_id 列表（逗号分隔）")
     p.add_argument("--write-notion", action="store_true")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--live", action="store_true")
+    p.add_argument("--live", action=argparse.BooleanOptionalAction,
+                   default=True, help="默认真实拉取 aihot；--no-live 关闭")
     p.add_argument("--config", default="config/sources.example.yaml")
     p.add_argument("--audience", default="config/audience_profile.yaml")
     p.add_argument("--shortlist", type=int, default=40,
@@ -1356,6 +1669,9 @@ def main() -> int:
     p.add_argument("--analyze", default="llm", choices=["heuristic", "llm"])
 
     args = ap.parse_args()
+    if args.cmd == "topics-round" and getattr(args, "aihot_file", None):
+        # 只有显式 --aihot-file 才走本地回放，避免误把假样例用于真实运行。
+        args.live = False
     if args.cmd == "collect":
         return cmd_collect(args)
     if args.cmd == "write-audience":
@@ -1382,6 +1698,8 @@ def main() -> int:
     if args.cmd == "rules":
         return cmd_rules(args)
     if args.cmd == "topics-round":
+        if getattr(args, "repair_round", None) or getattr(args, "repair_ids", None):
+            return cmd_topics_round_repair(args)
         return cmd_topics_round(args)
     return 1
 

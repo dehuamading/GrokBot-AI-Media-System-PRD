@@ -6,7 +6,7 @@
 3) 写入 03/02 的文本不含 X 帖子 >20 字连续原文/用户名/@handle；启发式标题概括；
 4) 机会型合并优先覆盖 aihot/github/official（达到备选）；
 5) 未调用 LLM 金额=未知（非 0）；OpenCode 记录 list_cost 且注明非实付；
-6) LLM 高分卡可出现“推荐”（不改 v3 阈值）；
+6) 最终推荐级别只按 v3-dual；LLM 高分只作文字参考；
 7) sources-check --official-limit 生效。
 """
 
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.analysis.audience import load_profile
 from src.analysis.llm_topics import shortlist
 from src.analysis.preference import load_recent_preferences
-from src.analysis.scoring import merge_dual_tracks
+from src.analysis.scoring import merge_dual_tracks, score_item_v3
 from src.analysis.topics import build_topic_cards
 from src.connectors import official_source
 from src.connectors.official_source import fetch_official
@@ -361,7 +361,7 @@ def test_opencode_list_cost_is_recorded_and_marked_non_paid(tmp_path):
 
 
 # --------------------------------------------------------- 6) 推荐级别
-def test_high_llm_score_can_still_be_recommended_without_threshold_change():
+def test_high_llm_score_is_only_reference_and_never_overrides_v3_level():
     mat = _material(
         "x_posts:1", "x_posts",
         "国内可用的免费开源 AI 教程，零基础手把手步骤，实测新能力降低门槛")
@@ -374,7 +374,10 @@ def test_high_llm_score_can_still_be_recommended_without_threshold_change():
     merged = run._postprocess_round_cards(
         [card], [mat], now=NOW, profile=PROFILE, max_cards=5)
     assert merged
-    assert merged[0]["推荐级别"] == "推荐"
+    v3 = score_item_v3(mat, now=NOW, profile=PROFILE)
+    assert merged[0]["推荐级别"] == v3["level"]
+    assert "LLM 参考分" in merged[0]["推荐理由"]
+    assert "不参与推荐级别" in merged[0]["推荐理由"]
 
 
 # ----------------------------------------------------- 7) official-limit
