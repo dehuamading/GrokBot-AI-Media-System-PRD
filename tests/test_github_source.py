@@ -105,6 +105,18 @@ def test_fetch_fields_complete_and_unknowns_marked(tmp_path, monkeypatch):
     assert "推测" in gh["worth_video"]
 
 
+def test_release_metadata_does_not_overwrite_repo_url(tmp_path, monkeypatch):
+    _install_fake(monkeypatch)
+    out = fetch_github(top=1, snapshots_path=tmp_path / "snap.json",
+                       include_readme=False)
+    gh = out["items"][0]["extra"]["github"]
+    assert gh["url"] == "https://github.com/example-org/repo-1"
+    assert gh["release_url"] == (
+        "https://github.com/example-org/repo-1/releases/tag/v1.2.0")
+    assert gh["release_tag"] == "v1.2.0"
+    assert gh["release_published_at"] == "2026-10-28T00:00:00Z"
+
+
 def test_no_previous_snapshot_does_not_count_growth(tmp_path, monkeypatch):
     _install_fake(monkeypatch)
     snap = tmp_path / "snap.json"

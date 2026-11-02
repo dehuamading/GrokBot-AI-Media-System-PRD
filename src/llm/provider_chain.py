@@ -8,9 +8,10 @@
 - 全部失败抛 LLMChainExhausted；
 - 接口与 GLMChat 保持鸭子类型兼容：chat / chat_json / calls / model。
 
-usage_log 每次成功调用记录 {provider, model, prompt_tokens, completion_tokens, cost}。
-cost 取接口返回（opencode usage.opencode.list_cost 或 usage.cost）；拿不到写
-字符串“未知”，绝不用 0 冒充未知。
+usage_log 每次成功调用记录 {provider, model, prompt_tokens, completion_tokens,
+cost, cost_basis}。cost 取接口返回（opencode usage.opencode.list_cost 或
+usage.cost）；拿不到写字符串“未知”，绝不用 0 冒充未知。cost_basis 标明口径：
+opencode list_cost 是套餐额度按标价折算（非实付），usage.cost 是接口返回。
 """
 
 from __future__ import annotations
@@ -125,6 +126,7 @@ class ProviderChain:
                     "prompt_tokens": usage["prompt_tokens"],
                     "completion_tokens": usage["completion_tokens"],
                     "cost": usage["cost"],
+                    "cost_basis": usage["cost_basis"],
                 }
                 self.usage_log.append(rec)
                 self.attempts.append({"provider": p.name, "model": p.model,
@@ -187,10 +189,13 @@ class ProviderChain:
         opencode = usage.get("opencode") or {}
         if isinstance(opencode, dict) and opencode.get("list_cost") is not None:
             cost = opencode["list_cost"]
+            cost_basis = "opencode-go套餐额度折算(美元,非实付)"
         elif usage.get("cost") is not None:
             cost = usage["cost"]
+            cost_basis = "接口返回"
         else:
             cost = UNKNOWN
+            cost_basis = UNKNOWN
 
         def _token(key: str):
             value = usage.get(key)
@@ -200,6 +205,7 @@ class ProviderChain:
             "prompt_tokens": _token("prompt_tokens"),
             "completion_tokens": _token("completion_tokens"),
             "cost": cost,
+            "cost_basis": cost_basis,
         }
 
     @staticmethod

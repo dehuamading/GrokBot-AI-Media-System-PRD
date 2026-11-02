@@ -288,9 +288,9 @@ def fetch_github(top: int = 5, themes: list[dict] | None = None, *,
             if tag:
                 latest_release = f"{tag}（{published or '日期未知'}）"
             release_extra = {
-                "tag": tag,
-                "published_at": release.get("published_at"),
-                "url": release.get("html_url"),
+                "release_tag": tag,
+                "release_published_at": release.get("published_at"),
+                "release_url": release.get("html_url"),
             }
         except Exception as exc:  # noqa: BLE001 - 无 release 是正常情况
             api_calls += 1

@@ -68,11 +68,16 @@ def _aggregate_usage(chat) -> dict:
     calls = getattr(chat, "calls", 0)
     if not usage:
         return {"calls": calls, "prompt_tokens": UNKNOWN,
-                "completion_tokens": UNKNOWN, "tokens": UNKNOWN, "cost": UNKNOWN}
+                "completion_tokens": UNKNOWN, "tokens": UNKNOWN, "cost": UNKNOWN,
+                "cost_basis": UNKNOWN}
 
     prompts = [u.get("prompt_tokens") for u in usage]
     completions = [u.get("completion_tokens") for u in usage]
     costs = [u.get("cost") for u in usage]
+    bases = [u.get("cost_basis") or UNKNOWN for u in usage]
+    unique_bases = list(dict.fromkeys(bases))
+    cost_basis = (unique_bases[0] if len(unique_bases) == 1
+                  else "混合（" + "、".join(unique_bases) + "）")
     if all(_is_number(v) for v in prompts) and all(_is_number(v) for v in completions):
         prompt_tokens = sum(prompts)
         completion_tokens = sum(completions)
@@ -81,7 +86,8 @@ def _aggregate_usage(chat) -> dict:
         prompt_tokens = completion_tokens = tokens = UNKNOWN
     cost = sum(costs) if all(_is_number(v) for v in costs) else UNKNOWN
     return {"calls": calls, "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens, "tokens": tokens, "cost": cost}
+            "completion_tokens": completion_tokens, "tokens": tokens, "cost": cost,
+            "cost_basis": cost_basis}
 
 
 def _log_collect_cost(args, out: dict, chat, analyze_mode: str) -> dict:
@@ -89,7 +95,8 @@ def _log_collect_cost(args, out: dict, chat, analyze_mode: str) -> dict:
     if chat is None:
         # 未使用 LLM：provider=无，金额 0（免费接口），不是“未知”冒充 0。
         stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                 "tokens": 0, "cost": 0}
+                 "tokens": 0, "cost": 0,
+                 "cost_basis": "免费接口（未使用LLM）"}
         provider, model = "无", "无"
         note = "免费接口（AIHot/GitHub/RSS/Releases）；未使用 LLM"
     else:
@@ -403,7 +410,7 @@ def cmd_github(args) -> int:
         "command": f"github --top {args.top}",
         "provider": "无", "model": "无",
         "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-        "tokens": 0, "cost": 0,
+        "tokens": 0, "cost": 0, "cost_basis": "免费接口（未使用LLM）",
         "external_api_calls": {"github": out["api_calls"], "aihot": 0,
                                "official": 0, "x": 0, "import": 0},
         "note": "免费接口（GitHub 官方 REST）；未使用 LLM",
@@ -494,7 +501,7 @@ def cmd_sources_check(args) -> int:
         "command": "sources-check",
         "provider": "无", "model": "无",
         "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-        "tokens": 0, "cost": 0,
+        "tokens": 0, "cost": 0, "cost_basis": "免费接口（未使用LLM）",
         "external_api_calls": out["external_calls"],
         "note": "免费接口（AIHot/GitHub REST/RSS/Releases）；未使用 LLM",
     })

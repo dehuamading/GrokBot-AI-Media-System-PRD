@@ -66,7 +66,7 @@ def test_order_opencode_first_and_session_header(monkeypatch):
     configure_all(monkeypatch)
     calls = scripted_post(monkeypatch, [ok("from-opencode", {
         "prompt_tokens": 10, "completion_tokens": 5,
-        "opencode": {"list_cost": 0.0012},
+        "opencode": {"list_cost": 0.0012}, "cost": 0,
     })])
 
     chain = ProviderChain()
@@ -79,6 +79,8 @@ def test_order_opencode_first_and_session_header(monkeypatch):
     assert sid and len(sid) >= 32
     assert chain.model == "opencode-go/deepseek-v4.1-flash"
     assert chain.usage_log[0]["cost"] == 0.0012
+    assert chain.usage_log[0]["cost_basis"] == (
+        "opencode-go套餐额度折算(美元,非实付)")
     assert chain.usage_log[0]["prompt_tokens"] == 10
     assert chain.usage_log[0]["completion_tokens"] == 5
 
@@ -168,6 +170,18 @@ def test_all_fail_raises_without_leaking_keys(monkeypatch):
 
 
 # ------------------------------------------------------------------ usage / JSON
+def test_cost_basis_for_api_returned_cost(monkeypatch):
+    configure_all(monkeypatch)
+    scripted_post(monkeypatch, [ok("from-opencode", {
+        "prompt_tokens": 1, "completion_tokens": 2, "cost": 0.02,
+    })])
+
+    chain = ProviderChain()
+    chain.chat("s", "u")
+    assert chain.usage_log[0]["cost"] == 0.02
+    assert chain.usage_log[0]["cost_basis"] == "接口返回"
+
+
 def test_unknown_cost_is_unknown_not_zero(monkeypatch):
     configure_all(monkeypatch)
     scripted_post(monkeypatch, [ok("from-opencode")])  # 无 usage
@@ -175,6 +189,7 @@ def test_unknown_cost_is_unknown_not_zero(monkeypatch):
     chain = ProviderChain()
     chain.chat("s", "u")
     assert chain.usage_log[0]["cost"] == "未知"
+    assert chain.usage_log[0]["cost_basis"] == "未知"
     assert chain.usage_log[0]["cost"] != 0
     assert chain.usage_log[0]["prompt_tokens"] == "未知"
     assert chain.usage_log[0]["completion_tokens"] == "未知"

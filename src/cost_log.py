@@ -1,7 +1,8 @@
 """成本日志：每次运行追加一行 JSONL 到 data/state/cost_log.jsonl（已 gitignore）。
 
-字段：时间、命令、provider、model、调用次数、tokens、金额、外部 API 调用计数。
-金额未知时写字符串“未知”，绝不用 0 冒充未知；接口明确返回 0 则保留 0。
+字段：时间、命令、provider、model、调用次数、tokens、金额、成本口径、外部 API
+调用计数。金额未知时写字符串“未知”，绝不用 0 冒充未知；接口明确返回 0 则保留 0。
+成本口径（cost_basis）说明金额来源，例如 OpenCode Go 套餐额度折算并非实付。
 同时写出中英文键名，便于人读与程序消费。
 """
 
@@ -43,6 +44,7 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
     completion_tokens = _pick(data, "completion_tokens", default=UNKNOWN)
     tokens = _pick(data, "tokens", default=UNKNOWN)
     cost = _normalize_cost(_pick(data, "cost", "金额", "amount"))
+    cost_basis = _pick(data, "cost_basis", "成本口径", default=UNKNOWN)
     external = _pick(data, "external_api_calls", "外部API调用", "external", default={})
     note = _pick(data, "note", "备注", default="")
 
@@ -57,6 +59,7 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
         "completion_tokens": completion_tokens,
         "tokens": tokens,
         "cost": cost,
+        "cost_basis": cost_basis,
         "external_api_calls": external,
         "note": note,
         # 中文列名（与任务书字段一一对应）
@@ -64,6 +67,7 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
         "命令": command,
         "调用次数": calls,
         "金额": cost,
+        "成本口径": cost_basis,
         "外部API调用": external,
         "备注": note,
     }

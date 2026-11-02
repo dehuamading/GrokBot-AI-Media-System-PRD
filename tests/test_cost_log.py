@@ -36,6 +36,25 @@ def test_unknown_cost_is_not_zero(tmp_path):
     assert line["external_api_calls"]["aihot"] == 1
 
 
+def test_cost_basis_is_preserved_in_log(tmp_path):
+    path = tmp_path / "cost_log.jsonl"
+    basis = "opencode-go套餐额度折算(美元,非实付)"
+    rec = append_cost(path, {"command": "collect", "cost": 0.0012,
+                             "cost_basis": basis})
+    assert rec["cost_basis"] == basis
+    assert rec["成本口径"] == basis
+    line = _read(path)[0]
+    assert line["cost_basis"] == basis
+    assert line["成本口径"] == basis
+
+
+def test_cost_basis_defaults_to_unknown(tmp_path):
+    path = tmp_path / "cost_log.jsonl"
+    rec = append_cost(path, {"command": "collect", "cost": 0})
+    assert rec["cost_basis"] == UNKNOWN
+    assert rec["成本口径"] == UNKNOWN
+
+
 def test_explicit_zero_cost_is_preserved(tmp_path):
     path = tmp_path / "cost_log.jsonl"
     rec = append_cost(path, {"command": "collect", "cost": 0})
