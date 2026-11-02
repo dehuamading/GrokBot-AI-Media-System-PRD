@@ -41,7 +41,8 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
     "01_原始素材": ("📥", {
         "item_id": _title(),
         "source_type": _sel("x_following", "x_posts", "x_discovery", "aihot", "overseas_case",
-                            "github_domestic", "feishu_domestic", "manual"),
+                            "github_domestic", "feishu_domestic", "manual",
+                            "github", "official", "import"),
         "source_url": _url(),
         "author_or_publisher": _rt(),
         "published_at": _date(),
@@ -160,7 +161,7 @@ DB_UPGRADES: dict[str, dict] = {
 
 # 只增下拉选项升级（不删除既有选项，不改动已有行数据）
 DB_SELECT_OPTION_UPGRADES: dict[str, dict[str, list[str]]] = {
-    "01_原始素材": {"source_type": ["x_posts"]},
+    "01_原始素材": {"source_type": ["x_posts", "github", "official", "import"]},
 }
 
 

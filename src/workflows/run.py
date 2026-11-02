@@ -37,6 +37,7 @@ from src.workflows.state import WorkflowState  # noqa: E402
 
 DEFAULT_PAGE_ID = "408d7d3b292381068024e0548308c638"
 DEFAULT_STATE = "data/state/workflow_state.json"
+NO_LLM_COST_BASIS = "无LLM调用；外部API为免费接口，实际金额未知"
 
 
 def make_llm(name: str) -> DraftClient:
@@ -168,7 +169,9 @@ def cmd_collect(args) -> int:
         else:
             from src.llm.provider_chain import ProviderChain
             chat = ProviderChain()  # OpenCode Go → GLM → DeepSeek；缺失的提供方自动跳过
-        short = llm_topics.shortlist(out["materials"], k=args.shortlist, profile=profile)
+        analysis_materials = pipeline.eligible_materials(out["materials"])
+        short = llm_topics.shortlist(analysis_materials, k=args.shortlist,
+                                     profile=profile)
         glm_scores = llm_topics.glm_score_posts(chat, short, profile)
         cards, meta = llm_topics.glm_build_cards(chat, short, profile,
                                                  glm_scores=glm_scores)
@@ -181,7 +184,7 @@ def cmd_collect(args) -> int:
             analyze_meta["engine"] = f"llm:{provider}/{model}"
         details = []
         used = {iid for c in cards for iid in c["关联素材"]}
-        for m in out["materials"]:
+        for m in analysis_materials:
             if m["item_id"] not in used:
                 continue
             gs = glm_scores.get(m["item_id"])
@@ -219,7 +222,7 @@ def cmd_collect(args) -> int:
         print(f"[LLM] 本次实际服务 provider/model：{provider} / {model}")
     if len(ana["cards"]) < 5:
         print(f"⚠️ 选题卡不足 5 张（{len(ana['cards'])}），仍按规则写入并标记 insufficient")
-    if not args.dry_run:
+    if (not args.dry_run) or args.live:
         _log_collect_cost(args, out, chat, analyze_mode)
 
     if args.dry_run:
@@ -377,12 +380,28 @@ def cmd_selfcheck(args) -> int:
 # ---------------------------------------------------------------------- github
 def cmd_github(args) -> int:
     """只做 GitHub 研究：真实官方 REST → data/state JSON + 终端表格，不写 Notion。"""
-    cfg = load_github_config(args.config)
-    out = fetch_github(top=args.top, themes=cfg["themes"],
-                       since_days=cfg["since_days"],
-                       snapshots_path=args.snapshots)
     state_dir = Path(args.state).parent
     state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cfg = load_github_config(args.config)
+        out = fetch_github(top=args.top, themes=cfg["themes"],
+                           since_days=cfg["since_days"],
+                           snapshots_path=args.snapshots)
+    except Exception as exc:  # noqa: BLE001 - 失败也要留下成本日志与非0退出
+        record = append_cost(state_dir / "cost_log.jsonl", {
+            "command": f"github --top {args.top}",
+            "provider": "无", "model": "无",
+            "calls": 0, "prompt_tokens": UNKNOWN, "completion_tokens": UNKNOWN,
+            "tokens": UNKNOWN, "cost": UNKNOWN,
+            "cost_basis": NO_LLM_COST_BASIS,
+            "external_api_calls": {"github": 0, "aihot": 0, "official": 0,
+                                   "x": 0, "import": 0},
+            "note": f"GitHub 命令失败：{type(exc).__name__}: {exc}",
+        })
+        print(f"[github] ❌ 失败：{type(exc).__name__}: {exc}")
+        print(f"[成本] provider={record['provider']} 金额={record['金额']}；"
+              f"成本口径={record['成本口径']}")
+        return 1
     stamp = iso_now().replace(":", "").replace("+", "_")
     path = state_dir / f"github_{stamp}.json"
     payload = {"time": iso_now(), "command": f"github --top {args.top}",
@@ -409,20 +428,21 @@ def cmd_github(args) -> int:
     record = append_cost(state_dir / "cost_log.jsonl", {
         "command": f"github --top {args.top}",
         "provider": "无", "model": "无",
-        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-        "tokens": 0, "cost": 0, "cost_basis": "免费接口（未使用LLM）",
+        "calls": 0, "prompt_tokens": UNKNOWN, "completion_tokens": UNKNOWN,
+        "tokens": UNKNOWN, "cost": UNKNOWN,
+        "cost_basis": NO_LLM_COST_BASIS,
         "external_api_calls": {"github": out["api_calls"], "aihot": 0,
                                "official": 0, "x": 0, "import": 0},
-        "note": "免费接口（GitHub 官方 REST）；未使用 LLM",
+        "note": "无 LLM 调用；GitHub 官方 REST 为免费接口，实际金额未知",
     })
     print(f"[成本] provider={record['provider']} 金额={record['金额']}；"
-          f"GitHub 请求 {out['api_calls']} 次（免费接口）")
+          f"成本口径={record['成本口径']}；GitHub 请求 {out['api_calls']} 次")
     return 0
 
 
 # ----------------------------------------------------------------- sources-check
 def cmd_sources_check(args) -> int:
-    """真实小样验证：采集→归一化→校验→去重；只写 data/state 与成本日志，不写 Notion。"""
+    """真实小样验证：采集→归一化→校验→去重；可选仅新增写入 01 小样。"""
     sources = ["aihot", "github", "official", "x", "import"]
     if not args.x_file:
         sources.remove("x")
@@ -478,6 +498,23 @@ def cmd_sources_check(args) -> int:
     for name, errs in (out.get("source_errors") or {}).items():
         print(f"[sources-check] ⚠️ {name} 源错误 {len(errs)} 条：{str(errs[0])[:180]}")
 
+    notion_summary = None
+    if getattr(args, "write_notion", False):
+        try:
+            client = NotionClient()
+            db_ids = ensure_kb(client, getattr(args, "page_id", DEFAULT_PAGE_ID))
+            ensure_kb_upgrades(client, db_ids)
+            notion_summary = pipeline.step_write_raw_materials_if_absent(
+                client, db_ids, out["materials"],
+                max_rows=getattr(args, "max_rows", 10),
+                sources=getattr(args, "notion_sources", "aihot,github,official"))
+        except Exception as exc:  # noqa: BLE001 - 写入失败要明确非0
+            print(f"[sources-check] ❌ Notion 写入失败："
+                  f"{type(exc).__name__}: {exc}")
+            return 1
+        print("[sources-check] Notion 01 写入摘要：")
+        print(json.dumps(notion_summary, ensure_ascii=False))
+
     stamp = iso_now().replace(":", "").replace("+", "_")
     path = state_dir / f"sources_check_{stamp}.json"
     payload = {
@@ -493,6 +530,8 @@ def cmd_sources_check(args) -> int:
         "source_errors": out.get("source_errors") or {},
         "items": out["materials"],
     }
+    if notion_summary is not None:
+        payload["notion_write"] = notion_summary
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                     encoding="utf-8")
     print(f"[sources-check] 结果已写入 {path}")
@@ -500,13 +539,14 @@ def cmd_sources_check(args) -> int:
     record = append_cost(state_dir / "cost_log.jsonl", {
         "command": "sources-check",
         "provider": "无", "model": "无",
-        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-        "tokens": 0, "cost": 0, "cost_basis": "免费接口（未使用LLM）",
+        "calls": 0, "prompt_tokens": UNKNOWN, "completion_tokens": UNKNOWN,
+        "tokens": UNKNOWN, "cost": UNKNOWN,
+        "cost_basis": NO_LLM_COST_BASIS,
         "external_api_calls": out["external_calls"],
-        "note": "免费接口（AIHot/GitHub REST/RSS/Releases）；未使用 LLM",
+        "note": "无 LLM 调用；外部 API 为免费接口，实际金额未知",
     })
     print(f"[成本] provider={record['provider']} 金额={record['金额']}；"
-          f"外部请求={record['external_api_calls']}（免费接口）")
+          f"成本口径={record['成本口径']}；外部请求={record['external_api_calls']}")
     return 0
 
 
@@ -596,6 +636,12 @@ def main() -> int:
     p.add_argument("--x-file", dest="x_file", default=None)
     p.add_argument("--import-file", default=None)
     p.add_argument("--config", default="config/sources.example.yaml")
+    p.add_argument("--write-notion", action="store_true",
+                   help="仅新增写入 01_原始素材 小样（需 NOTION_TOKEN；已有行不改）")
+    p.add_argument("--max-rows", type=int, default=10,
+                   help="--write-notion 单次最多新增行数（默认 10）")
+    p.add_argument("--notion-sources", default="aihot,github,official",
+                   help="--write-notion 允许写入的来源（默认不含 X 与 import）")
 
     args = ap.parse_args()
     if args.cmd == "collect":

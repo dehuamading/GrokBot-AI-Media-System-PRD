@@ -201,3 +201,50 @@ def test_chat_json_parses_fenced_json(monkeypatch):
 
     chain = ProviderChain()
     assert chain.chat_json("s", "u") == {"score": 8}
+
+
+# ------------------------------------------------------------------ 计数口径
+def test_calls_count_attempts_and_successful_calls_separately(monkeypatch):
+    configure_all(monkeypatch)
+    scripted_post(monkeypatch, [FakeResp(429, {}), ok("from-glm")])
+
+    chain = ProviderChain()
+    assert chain.chat("s", "u") == "from-glm"
+    assert chain.calls == 2
+    assert len(chain.attempts) == 2
+    assert chain.successful_calls == 1
+
+
+def test_connection_error_falls_back_to_next_provider(monkeypatch):
+    configure_all(monkeypatch)
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.ConnectionError("network down")
+        return ok("from-glm")
+
+    monkeypatch.setattr("src.llm.provider_chain.requests.post", fake_post)
+    chain = ProviderChain()
+    assert chain.chat("s", "u") == "from-glm"
+    assert chain.model == "glm/glm-5.1"
+    assert chain.successful_calls == 1
+    assert "网络错误" in chain.attempts[0]["reason"]
+
+
+def test_timeout_falls_back_to_next_provider(monkeypatch):
+    configure_all(monkeypatch)
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.Timeout("timed out")
+        return ok("from-glm")
+
+    monkeypatch.setattr("src.llm.provider_chain.requests.post", fake_post)
+    chain = ProviderChain()
+    assert chain.chat("s", "u") == "from-glm"
+    assert chain.attempts[0]["reason"] == "超时"
+    assert chain.successful_calls == 1

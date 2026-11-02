@@ -113,6 +113,38 @@ def test_draft_one_per_platform_idempotent_rerun(tmp_path):
     assert len(client.databases["04_文案与版本"]["rows"]) == len(r2["drafts"])
 
 
+def test_ineligible_material_does_not_enter_topic_analysis(tmp_path):
+    """校验失败（eligible_for_topic=False）的素材不得进入选题分析。"""
+    state = WorkflowState(tmp_path / "state.json")
+    out = pipeline.step_collect(state, aihot_file=FAKE, x_following_file=XF,
+                                snapshot_dir=None)
+    bad_id = out["materials"][0]["item_id"]
+    out["materials"][0]["eligible_for_topic"] = False
+    ana = pipeline.step_analyze(state, out["materials"], top_k=8)
+    assert all(d["item"]["item_id"] != bad_id for d in ana["details"])
+    assert all(bad_id not in c["关联素材"] for c in ana["cards"])
+
+
+def test_live_aihot_failure_is_isolated(tmp_path):
+    def boom(**kw):
+        raise RuntimeError("aihot boom")
+
+    state = WorkflowState(tmp_path / "s.json")
+    out = pipeline.step_collect(state, snapshot_dir=None, sources=["aihot"],
+                                live=True, fetcher=boom)
+    assert out["materials"] == []
+    assert out["source_errors"]["aihot"]
+    assert "aihot boom" in out["source_errors"]["aihot"][0]
+
+
+def test_import_source_without_file_prints_warning(tmp_path, capsys):
+    state = WorkflowState(tmp_path / "s.json")
+    pipeline.step_collect(state, snapshot_dir=None, sources=["import"],
+                          import_file=None)
+    output = capsys.readouterr().out
+    assert "import" in output and "--import-file" in output
+
+
 def test_live_fetch_never_called_by_default(tmp_path, monkeypatch):
     """默认（非 --live）绝不触发真实抓取：注入会爆炸的 fetcher 验证未被调用。"""
 

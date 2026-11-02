@@ -53,6 +53,12 @@ def test_platform_and_license_are_required():
     assert validate_item(_item(platform="xiaohongshu", source_type="import")) == []
 
 
+def test_license_status_starting_with_public_is_allowed():
+    it = _item(license_status="公开+许可证:MIT")
+    assert validate_item(it) == []
+    assert it["eligible_for_topic"] is True
+
+
 def test_dedupe_normalizes_scheme_trailing_slash_and_tracking():
     a = _item(item_id="x:1", source_type="aihot", platform="aihot",
               source_url="https://Example.com/post/?utm_source=rss")

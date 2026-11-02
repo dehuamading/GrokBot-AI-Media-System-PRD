@@ -152,9 +152,10 @@ def test_load_x_posts_x_api_raw_maps_author_and_metrics(tmp_path):
     assert p["origin_agent"] == "grokbot"
     assert p["license_status"] == "公开"
     assert p["keywords"] == ["AI"]
-    # 不凭空拼接 URL：留空并记录 errors，validate 允许该缺失
-    assert p["source_url"] == ""
-    assert p["errors"]
+    # X API 原样格式：username 与 id 齐备时构造可追溯 URL，并显式标注
+    assert p["source_url"] == "https://x.com/example_api_user/status/api-1001"
+    assert p["extra"]["url_constructed"] is True
+    assert p["errors"] == []
     assert validate_item(p) == []
 
 
@@ -213,6 +214,57 @@ def test_top_level_replies_attach_by_conversation_or_parent(tmp_path):
     by_id = {p["item_id"]: p for p in posts}
     assert by_id["x_posts:p-1"]["comments"][0]["text"].startswith("挂在 p-1")
     assert by_id["x_posts:p-2"]["comments"][0]["text"].startswith("挂在 p-2")
+
+
+def test_reply_entry_in_posts_does_not_overwrite_root_conversation(tmp_path):
+    payload = {
+        "posts": [
+            {"id": "p-1", "url": "https://x.com/example/status/p-1",
+             "author_username": "root_user",
+             "created_at": "2026-10-30T02:00:00Z",
+             "text": "根帖（假数据）", "conversation_id": "conv-1"},
+            {"id": "p-2", "url": "https://x.com/example/status/p-2",
+             "author_username": "reply_user",
+             "created_at": "2026-10-30T03:00:00Z",
+             "text": "帖内回复条目（假数据）", "conversation_id": "conv-1",
+             "in_reply_to": "p-1"},
+        ],
+        "replies": [
+            {"id": "tr-1", "text": "顶层回复（假数据）",
+             "created_at": "2026-10-30T04:00:00Z", "conversation_id": "conv-1",
+             "author_username": "secret_replier"},
+        ],
+    }
+    posts = load_x_posts(_write_json(tmp_path, "root_guard.json", payload))
+    by_id = {p["item_id"]: p for p in posts}
+    assert by_id["x_posts:p-1"]["comments"][0]["text"] == "顶层回复（假数据）"
+    assert by_id["x_posts:p-2"]["comments"] == []
+    blob = json.dumps(posts, ensure_ascii=False)
+    assert "secret_replier" not in blob
+
+
+def test_orphan_top_level_reply_is_counted_without_usernames(tmp_path):
+    payload = {
+        "posts": [{"id": "p-1", "url": "https://x.com/example/status/p-1",
+                   "author_username": "root_user",
+                   "created_at": "2026-10-30T02:00:00Z",
+                   "text": "根帖（假数据）"}],
+        "replies": [
+            {"id": "tr-1", "text": "孤儿回复一（假数据）",
+             "created_at": "2026-10-30T03:00:00Z",
+             "conversation_id": "orphan-conv",
+             "author_username": "orphan_user_one"},
+            {"id": "tr-2", "text": "孤儿回复二（假数据）",
+             "created_at": "2026-10-30T03:10:00Z",
+             "in_reply_to": "missing-post",
+             "author_username": "orphan_user_two"},
+        ],
+    }
+    posts = load_x_posts(_write_json(tmp_path, "orphans.json", payload))
+    assert posts[0]["comments"] == []
+    assert posts.errors and "2" in posts.errors[0]
+    blob = json.dumps(posts.errors, ensure_ascii=False)
+    assert "orphan_user" not in blob
 
 
 def test_bad_x_api_and_reply_data_raise(tmp_path):

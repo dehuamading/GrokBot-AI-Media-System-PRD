@@ -11,8 +11,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.normalize import normalize_github_item, normalize_official_item
+from src.notion_store.bootstrap import ensure_kb, ensure_kb_upgrades
 from src.workflows import pipeline, run
 from src.workflows.state import WorkflowState
+from tests.fakes import FakeNotionClient
 
 REPO = Path(__file__).resolve().parents[1]
 IMPORT_SAMPLE = REPO / "tests" / "fixtures" / "import_sample_masked.json"
@@ -108,7 +110,10 @@ def test_sources_check_writes_summary_and_cost(tmp_path, monkeypatch, capsys):
     cost = [json.loads(line) for line in
             (tmp_path / "cost_log.jsonl").read_text(encoding="utf-8").splitlines()]
     assert cost[-1]["command"] == "sources-check"
-    assert cost[-1]["provider"] == "无" and cost[-1]["cost"] == 0
+    assert cost[-1]["provider"] == "无"
+    assert cost[-1]["cost"] != 0
+    assert cost[-1]["cost"] == run.UNKNOWN
+    assert cost[-1]["cost_basis"] == run.NO_LLM_COST_BASIS
     assert "合计" in capsys.readouterr().out
 
 
@@ -128,5 +133,88 @@ def test_github_command_writes_json_and_cost(tmp_path, monkeypatch, capsys):
     cost = [json.loads(line) for line in
             (tmp_path / "cost_log.jsonl").read_text(encoding="utf-8").splitlines()]
     assert cost[-1]["external_api_calls"]["github"] == 4
-    assert cost[-1]["provider"] == "无" and cost[-1]["cost"] == 0
+    assert cost[-1]["provider"] == "无"
+    assert cost[-1]["cost"] != 0
+    assert cost[-1]["cost"] == run.UNKNOWN
+    assert cost[-1]["cost_basis"] == run.NO_LLM_COST_BASIS
     assert "GitHub 请求 4 次" in capsys.readouterr().out
+
+
+def test_github_command_failure_logs_cost_and_returns_nonzero(tmp_path, monkeypatch,
+                                                              capsys):
+    def boom(**kw):
+        raise RuntimeError("gh boom")
+
+    monkeypatch.setattr(run, "fetch_github", boom)
+    args = argparse.Namespace(state=str(tmp_path / "state.json"), top=1,
+                              config=str(tmp_path / "missing.yaml"),
+                              snapshots=str(tmp_path / "snap.json"))
+    assert run.cmd_github(args) != 0
+    cost = [json.loads(line) for line in
+            (tmp_path / "cost_log.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert cost[-1]["cost"] == run.UNKNOWN
+    assert cost[-1]["cost_basis"] == run.NO_LLM_COST_BASIS
+    assert "gh boom" in capsys.readouterr().out
+
+
+def test_sources_check_write_notion_mock_skips_existing_and_never_updates(
+        tmp_path, monkeypatch):
+    """mock：只新增缺失行；已存在行绝不 update/delete；遵守来源过滤与行数上限。"""
+    existing = _gh_item()
+    existing["item_id"] = "github:example-org/existing"
+    existing["title_or_summary"] = "已存在素材（假数据）"
+    new1 = _gh_item()
+    new1["item_id"] = "github:example-org/new-1"
+    new1["title_or_summary"] = "新素材一（假数据）"
+    new2 = _gh_item()
+    new2["item_id"] = "github:example-org/new-2"
+    new2["title_or_summary"] = "新素材二（假数据）"
+    x_item = json.loads(json.dumps(new2, ensure_ascii=False))
+    x_item.update(item_id="x_posts:1", source_type="x_posts", platform="x")
+
+    out = {
+        "materials": [x_item, existing, new1, new2],
+        "accounts": [], "dropped": [], "snapshot": None, "x_posts": 1,
+        "per_source": {"aihot": 0, "github": 3, "official": 0,
+                       "x": 1, "import": 0},
+        "validation_error_counts": {}, "source_errors": {},
+        "external_calls": {"github": 1, "aihot": 0, "official": 0,
+                           "x": 0, "import": 0},
+        "sources": ["aihot", "github", "official", "x", "import"],
+    }
+    monkeypatch.setattr(run.pipeline, "step_collect", lambda *a, **kw: out)
+
+    fake = FakeNotionClient()
+    db_ids = ensure_kb(fake, "root")
+    ensure_kb_upgrades(fake, db_ids)
+    fake.upsert_row(db_ids["01_原始素材"], "item_id", existing["item_id"], {
+        "title_or_summary": {"rich_text": [{"text": {"content": "原始值"}}]},
+    })
+    before_props = json.loads(json.dumps(
+        fake.row("01_原始素材", "item_id", existing["item_id"])["properties"],
+        ensure_ascii=False))
+
+    monkeypatch.setattr(run, "NotionClient", lambda: fake)
+    args = argparse.Namespace(
+        state=str(tmp_path / "state.json"), x_file="x.json", import_file=None,
+        github_top=1, official_limit=1, aihot_limit=1,
+        config="config/sources.example.yaml", page_id="root",
+        write_notion=True, max_rows=2,
+        notion_sources="aihot,github,official")
+    assert run.cmd_sources_check(args) == 0
+
+    after_props = json.loads(json.dumps(
+        fake.row("01_原始素材", "item_id", existing["item_id"])["properties"],
+        ensure_ascii=False))
+    assert after_props == before_props  # 已存在行未被 update
+
+    files = list(tmp_path.glob("sources_check_*.json"))
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    summary = payload["notion_write"]
+    assert summary["before_count"] == 1
+    assert summary["after_count"] == 3
+    assert [w["item_id"] for w in summary["written"]] == [
+        new1["item_id"], new2["item_id"]]
+    assert summary["skipped_existing"] == 1
+    assert all(w["item_id"] != x_item["item_id"]
+               for w in summary["written"])

@@ -82,7 +82,9 @@ class ProviderChain:
         self.session_id = session_id or str(uuid.uuid4())
         self._providers = providers if providers is not None else load_providers(self.session_id)
         self._timeout = timeout
+        # calls 兼容旧消费方 = 尝试次数（attempts）；successful_calls 只计成功。
         self.calls = 0
+        self.successful_calls = 0
         self.usage_log: list[dict] = []
         self.attempts: list[dict] = []
         self.skipped: list[dict] = []
@@ -129,6 +131,7 @@ class ProviderChain:
                     "cost_basis": usage["cost_basis"],
                 }
                 self.usage_log.append(rec)
+                self.successful_calls += 1
                 self.attempts.append({"provider": p.name, "model": p.model,
                                       "ok": True, "reason": ""})
                 self._last_provider, self._last_model = p.name, p.model

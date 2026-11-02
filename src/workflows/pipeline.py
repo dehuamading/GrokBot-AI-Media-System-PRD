@@ -76,8 +76,15 @@ def step_collect(state, *, aihot_file: str | Path | None = None,
     accounts: list[dict] = []
 
     if "aihot" in selected:
-        aihot_items = (fetcher(limit=aihot_limit) if live
-                       else (loader(aihot_file) if aihot_file else []))
+        if live:
+            try:
+                aihot_items = fetcher(limit=aihot_limit)
+            except Exception as exc:  # noqa: BLE001 - 单源失败不拖垮其他来源
+                aihot_items = []
+                source_errors["aihot"] = [
+                    f"aihot 拉取失败：{type(exc).__name__}: {exc}"]
+        else:
+            aihot_items = loader(aihot_file) if aihot_file else []
         materials.extend(aihot_items)
         per_source["aihot"] = len(aihot_items)
         external["aihot"] = 1 if live else 0
@@ -86,6 +93,8 @@ def step_collect(state, *, aihot_file: str | Path | None = None,
         x_posts = x_posts_loader(x_posts_file) if x_posts_file else []
         materials.extend(x_posts)
         per_source["x"] = len(x_posts)
+        if getattr(x_posts, "errors", None):
+            source_errors["x"] = list(x_posts.errors)
         accounts = following_loader(x_following_file) if x_following_file else []
 
     if "github" in selected:
@@ -116,6 +125,8 @@ def step_collect(state, *, aihot_file: str | Path | None = None,
         if off.get("errors"):
             source_errors["official"] = list(off["errors"])
 
+    if "import" in selected and not import_file:
+        print("⚠️ --sources 含 import 但未提供 --import-file：已跳过 import")
     if "import" in selected and import_file:
         imported = import_loader(import_file, errors_path=import_errors_path)
         materials.extend(imported.get("items") or [])
@@ -158,9 +169,15 @@ def step_collect(state, *, aihot_file: str | Path | None = None,
 
 
 # ---------------------------------------------------------------------- S2
+def eligible_materials(materials: list[dict]) -> list[dict]:
+    """校验失败的素材不得进入选题分析（未校验过的素材默认保留）。"""
+    return [m for m in materials if m.get("eligible_for_topic") is not False]
+
+
 def step_analyze(state, materials: list[dict], top_k: int = 8,
                  profile=None) -> dict:
     """S2 分析：去重(已在前置)→分类→评分→选题卡。纯本地（启发式；GLM 路径见 run.py）。"""
+    materials = eligible_materials(materials)
     cards, details = build_topic_cards(materials, top_k=top_k, profile=profile)
     for d in details:
         d["item"]["content_type"] = d["content_type"]
@@ -182,6 +199,77 @@ def step_analyze(state, materials: list[dict], top_k: int = 8,
 
 
 # ---------------------------------------------------------------------- S3
+def _material_notion_properties(it: dict, *, extended: bool = False) -> dict:
+    from src.notion_store.client import (date_prop, number_prop, rt,
+                                         select_prop, url_prop)
+    extra = it.get("extra") or {}
+    props = {
+        "source_type": select_prop(it["source_type"]),
+        "source_url": url_prop(it["source_url"]),
+        "author_or_publisher": rt(it["author_or_publisher"]),
+        "published_at": date_prop(it["published_at"]),
+        "collected_at": date_prop(it["collected_at"]),
+        "title_or_summary": rt(it["title_or_summary"]),
+        "claims": rt(" | ".join(c for c in it.get("claims") or [] if c)),
+        "evidence_status": select_prop(it["evidence_status"]),
+        "processing_status": select_prop(it["processing_status"]),
+        "screen_score": number_prop(it.get("screen_score")),
+        "screen_reasons": rt("; ".join(it.get("screen_reasons") or [])[:1800]),
+        "aihot_score": number_prop(extra.get("aihot_score")),
+        "category": rt(str(extra.get("category") or "")),
+        "aihot_url": url_prop(extra.get("aihot_url")),
+    }
+    if extended:
+        # 仅在 01 已存在这些列时才会写入（调用方按 schema 过滤，不建新列）。
+        props.update({
+            "platform": select_prop(it.get("platform")),
+            "license_status": rt(str(it.get("license_status") or "")),
+            "tool_or_method": rt(" | ".join(it.get("tool_or_method") or [])),
+            "keywords": rt(" | ".join(it.get("keywords") or [])),
+        })
+    return props
+
+
+def _notion_source_types(sources) -> set[str] | None:
+    if sources is None:
+        return None
+    if isinstance(sources, str):
+        sources = [s.strip() for s in sources.split(",") if s.strip()]
+    mapping = {"x": "x_posts"}
+    return {mapping.get(str(s).strip().lower(), str(s).strip().lower())
+            for s in sources}
+
+
+def step_write_raw_materials_if_absent(client, db_ids, materials: list[dict], *,
+                                       max_rows: int = 10,
+                                       sources=None) -> dict:
+    """01 小样写入：只新增缺失行，绝不 update/delete 已存在行。"""
+    db_id = db_ids["01_原始素材"]
+    before_count = len(client.query_database(db_id))
+    schema = set((client.get_database(db_id).get("properties") or {}).keys())
+    allowed = _notion_source_types(sources)
+    written: list[dict] = []
+    skipped: list[str] = []
+    for it in materials:
+        if len(written) >= max(0, int(max_rows)):
+            break
+        if allowed is not None and it.get("source_type") not in allowed:
+            continue
+        props = _material_notion_properties(it, extended=True)
+        props = {k: v for k, v in props.items() if k in schema}
+        _, created = client.create_row_if_absent(
+            db_id, "item_id", it["item_id"], props)
+        if created:
+            written.append({"item_id": it["item_id"],
+                            "title": it.get("title_or_summary") or ""})
+        else:
+            skipped.append(it["item_id"])
+    after_count = len(client.query_database(db_id))
+    return {"before_count": before_count, "after_count": after_count,
+            "written": written, "skipped_existing": len(skipped),
+            "skipped_existing_items": skipped}
+
+
 def step_write_topics(client, db_ids, cards: list[dict],
                       materials: list[dict], page_ids: dict[str, str] | None = None,
                       only_referenced: bool = True) -> dict:
@@ -190,31 +278,15 @@ def step_write_topics(client, db_ids, cards: list[dict],
     only_referenced=True（任务05）：01 只写被选题卡引用到的素材，
     避免把上千条原始帖子写进 Notion。
     """
-    from src.notion_store.client import (date_prop, number_prop, rt,
-                                         select_prop, url_prop)
+    from src.notion_store.client import number_prop, rt, select_prop
     page_ids = page_ids or {}
     if only_referenced:
         used_ids = {iid for c in cards for iid in c["关联素材"]}
         materials = [m for m in materials if m["item_id"] in used_ids]
     n_mat = 0
     for it in materials:
-        extra = it.get("extra") or {}
-        client.upsert_row(db_ids["01_原始素材"], "item_id", it["item_id"], {
-            "source_type": select_prop(it["source_type"]),
-            "source_url": url_prop(it["source_url"]),
-            "author_or_publisher": rt(it["author_or_publisher"]),
-            "published_at": date_prop(it["published_at"]),
-            "collected_at": date_prop(it["collected_at"]),
-            "title_or_summary": rt(it["title_or_summary"]),
-            "claims": rt(" | ".join(c for c in it.get("claims") or [] if c)),
-            "evidence_status": select_prop(it["evidence_status"]),
-            "processing_status": select_prop(it["processing_status"]),
-            "screen_score": number_prop(it.get("screen_score")),
-            "screen_reasons": rt("; ".join(it.get("screen_reasons") or [])[:1800]),
-            "aihot_score": number_prop(extra.get("aihot_score")),
-            "category": rt(str(extra.get("category") or "")),
-            "aihot_url": url_prop(extra.get("aihot_url")),
-        })
+        client.upsert_row(db_ids["01_原始素材"], "item_id", it["item_id"],
+                          _material_notion_properties(it))
         n_mat += 1
 
     n_top = 0

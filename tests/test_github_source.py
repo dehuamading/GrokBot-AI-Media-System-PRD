@@ -90,7 +90,7 @@ def test_fetch_fields_complete_and_unknowns_marked(tmp_path, monkeypatch):
     assert it["origin_agent"] == "pi"
     assert it["source_type"] == "github"
     assert it["metrics"]["stars"] == 5000
-    assert it["license_status"] == "公开"
+    assert it["license_status"] == "公开+许可证:MIT"
     assert it["source_url"].startswith("https://github.com/example-org/")
     for key in ("name", "url", "purpose", "stars", "last_update",
                 "latest_release", "license", "install_difficulty",
@@ -164,3 +164,103 @@ def test_unknown_paid_api_is_pending_not_invented(tmp_path, monkeypatch):
                        include_readme=False)
     gh = out["items"][0]["extra"]["github"]
     assert gh["needs_paid_api"] in {"是（推测）", "否（推测）", "待验证"}
+
+
+def test_theme_queries_run_independently_and_merge_by_full_name(tmp_path, monkeypatch):
+    """queries 列表：每条独立搜索，同一 full_name 合并去重。"""
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None, **kw):
+        q = (params or {}).get("q", "")
+        calls.append(q)
+        if url.endswith("/search/repositories"):
+            if "topic:ai-coding" in q:
+                return FakeResponse(payload={"items": [
+                    _repo(1, 5000, "coding topic（假数据）", ["ai-coding"]),
+                    _repo(2, 3000, "coding topic two（假数据）", ["ai-coding"]),
+                ]})
+            if '"AI coding"' in q:
+                return FakeResponse(payload={"items": [
+                    _repo(1, 5000, "coding topic（假数据）", ["ai-coding"]),
+                    _repo(6, 2000, "coding description（假数据）", ["ai"]),
+                ]})
+            return FakeResponse(payload={"items": []})
+        if url.endswith("/releases/latest"):
+            return FakeResponse(status=404, payload={"message": "Not Found"})
+        if url.endswith("/readme"):
+            return FakeResponse(text="")
+        return FakeResponse(status=404, payload={})
+
+    monkeypatch.setattr(github_source.requests, "get", fake_get)
+    themes = [{"id": "ai_coding", "label": "AI coding", "queries": [
+        "topic:ai-coding", '"AI coding" in:description']}]
+    out = fetch_github(top=5, themes=themes,
+                       snapshots_path=tmp_path / "s.json", include_readme=False)
+    search_calls = [q for q in calls if q]
+    assert len(search_calls) == 2
+    assert out["per_theme"]["ai_coding"] == 3
+    names = [it["extra"]["github"]["full_name"] for it in out["items"]]
+    assert len(names) == len(set(names))
+    assert len(names) == 3
+
+
+def test_theme_missing_id_does_not_raise_keyerror(tmp_path, monkeypatch):
+    def fake_get(url, params=None, headers=None, timeout=None, **kw):
+        if url.endswith("/search/repositories"):
+            raise RuntimeError("search boom")
+        return FakeResponse(status=404, payload={})
+
+    monkeypatch.setattr(github_source.requests, "get", fake_get)
+    out = fetch_github(top=1, themes=[{"label": "无ID主题",
+                                       "queries": ["topic:x"]}],
+                       snapshots_path=tmp_path / "s.json", include_readme=False)
+    assert out["per_theme"]["无ID主题"] == 0
+    assert "无ID主题" in out["errors"][0]
+
+
+def test_missing_latest_release_404_is_normal_not_error(tmp_path, monkeypatch):
+    _install_fake(monkeypatch)
+    out = fetch_github(top=5, snapshots_path=tmp_path / "s.json",
+                       include_readme=False)
+    repo4 = next(it for it in out["items"]
+                 if it["extra"]["github"]["full_name"] == "example-org/repo-4")
+    assert repo4["extra"]["github"]["latest_release"] == "无"
+    assert not any("repo-4" in err for err in out["errors"])
+
+
+def test_load_config_supports_queries_and_legacy_query(tmp_path):
+    path = tmp_path / "sources.yaml"
+    path.write_text(
+        "github:\n"
+        "  themes:\n"
+        "    - id: legacy\n"
+        "      label: Legacy\n"
+        "      query: topic:legacy\n"
+        "    - id: legacy_or\n"
+        "      label: Legacy OR\n"
+        "      query: 'topic:a OR topic:b'\n"
+        "    - id: split\n"
+        "      label: Split\n"
+        "      queries: ['topic:a', '\"b\" in:description']\n",
+        encoding="utf-8")
+    cfg = github_source.load_config(path)
+    by_id = {t["id"]: t for t in cfg["themes"]}
+    assert by_id["legacy"]["queries"] == ["topic:legacy"]
+    assert by_id["legacy_or"]["queries"] == ["topic:a", "topic:b"]
+    assert by_id["split"]["queries"] == ["topic:a", '"b" in:description']
+    example = github_source.load_config("config/sources.example.yaml")
+    assert not any(" OR " in query for theme in example["themes"]
+                   for query in theme["queries"])
+
+
+def test_existing_snapshot_yields_numeric_stars_delta(tmp_path, monkeypatch):
+    _install_fake(monkeypatch)
+    snap = tmp_path / "s.json"
+    snap.write_text(json.dumps({"repos": {"example-org/repo-1": [{
+        "collected_at": "2026-10-20T00:00:00+00:00", "stars": 4000}]}}),
+        encoding="utf-8")
+    now = datetime(2026, 10, 30, 0, 0, tzinfo=timezone.utc)
+    out = fetch_github(top=1, snapshots_path=snap, include_readme=False, now=now)
+    gh = out["items"][0]["extra"]["github"]
+    assert gh["stars_delta"] == 1000
+    assert gh["stars_delta_days"] == 10

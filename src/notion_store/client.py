@@ -141,6 +141,21 @@ class NotionClient:
         )
         return rows[0]["id"] if rows else None
 
+    def create_row_if_absent(self, db_id: str, title_prop: str,
+                             title_value: str,
+                             props: dict) -> tuple[str, bool]:
+        """仅在 title 不存在时创建；已存在则直接返回，绝不 update/delete。"""
+        existing = self.find_row_by_title(db_id, title_prop, title_value)
+        if existing:
+            return existing, False
+        page = self.create_page(
+            {"type": "database_id", "database_id": db_id},
+            {title_prop: {"title": [{"text": {"content": title_value}}]}})
+        rest = {k: v for k, v in props.items() if k != title_prop}
+        if rest:
+            self.update_page(page["id"], rest)
+        return page["id"], True
+
     def upsert_row(self, db_id: str, title_prop: str, title_value: str,
                    props: dict) -> tuple[str, bool]:
         """按 title 唯一键 upsert 一行，返回 (page_id, 是否新建)。"""

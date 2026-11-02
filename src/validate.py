@@ -109,7 +109,8 @@ def validate_item(item: dict) -> list[str]:
     license_status = item.get("license_status")
     if not license_status:
         errors.append("缺少 license_status")
-    elif license_status not in VALID_LICENSE_STATUS:
+    elif (license_status not in VALID_LICENSE_STATUS
+          and not str(license_status).startswith("公开")):
         errors.append(f"非法 license_status: {license_status}")
 
     item["validation_errors"] = list(errors)

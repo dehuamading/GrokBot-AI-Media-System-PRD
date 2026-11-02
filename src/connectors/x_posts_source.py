@@ -20,6 +20,14 @@ REQUIRED_RAW_FIELDS = ["id", "text", "created_at"]
 FLAT_REQUIRED_RAW_FIELDS = ["id", "url", "text", "created_at"]
 
 
+class XPostsResult(list):
+    """帖子列表 + 文件级错误（例如无法归属的孤儿回复），仍保持 list 兼容。"""
+
+    def __init__(self, items=()):
+        super().__init__(items)
+        self.errors: list[str] = []
+
+
 def _is_api_post(raw: dict) -> bool:
     return "author_id" in raw or "public_metrics" in raw
 
@@ -48,8 +56,30 @@ def _parse_payload(data) -> tuple[list, list, dict, bool]:
     raise ValueError("X 帖子文件应为扁平数组、{\"posts\": [...]} 或 X API data[] 格式")
 
 
+def _has_reply_marker(raw: dict) -> bool:
+    for key in ("parent_id", "in_reply_to", "in_reply_to_id",
+                "in_reply_to_status_id", "reply_to"):
+        if raw.get(key):
+            return True
+    refs = raw.get("referenced_tweets")
+    if isinstance(refs, list):
+        return any(isinstance(ref, dict)
+                   and ref.get("type") in ("replied_to", "reply")
+                   for ref in refs)
+    return False
+
+
+def _is_root_post(raw: dict) -> bool:
+    """只允许根帖注册 conversation 映射，避免回复条目覆盖根帖。"""
+    raw_id = str(raw.get("id") or "")
+    conversation = raw.get("conversation_id")
+    if conversation is not None and str(conversation) == raw_id:
+        return True
+    return not _has_reply_marker(raw)
+
+
 def _attach_top_replies(posts_raw: list[dict], items: list[dict],
-                        replies: list) -> None:
+                        replies: list) -> list[str]:
     """按 conversation_id / parent id 把顶层回复挂到帖子 comments。"""
     post_by_id: dict[str, dict] = {}
     post_by_conversation: dict[str, dict] = {}
@@ -57,9 +87,11 @@ def _attach_top_replies(posts_raw: list[dict], items: list[dict],
         raw_id = str(raw.get("id") or "")
         if raw_id:
             post_by_id[raw_id] = item
+        if not _is_root_post(raw):
+            continue
         conversation = raw.get("conversation_id") or raw.get("id")
         if conversation:
-            post_by_conversation[str(conversation)] = item
+            post_by_conversation.setdefault(str(conversation), item)
 
     # 预先建立「回复 id → conversation_id」映射，支持父回复再挂到同一会话。
     reply_conversation: dict[str, str] = {}
@@ -70,6 +102,7 @@ def _attach_top_replies(posts_raw: list[dict], items: list[dict],
             if reply_id and conversation:
                 reply_conversation[reply_id] = str(conversation)
 
+    orphans = 0
     for i, raw in enumerate(replies):
         if not isinstance(raw, dict):
             raise ValueError(f"第 {i} 条顶层回复不是对象")
@@ -90,11 +123,17 @@ def _attach_top_replies(posts_raw: list[dict], items: list[dict],
                           or post_by_id.get(parent_conversation))
 
         if target is None:
+            orphans += 1
             continue  # 无法归属到任何帖子时不编造归属
         target["comments"].append(comment)
         target["user_problem_evidence"] = [
             c["text"] for c in target["comments"] if c.get("text")
         ][:5]
+
+    errors: list[str] = []
+    if orphans:
+        errors.append(f"顶层回复无法归属到任何帖子：{orphans} 条（未记录用户名）")
+    return errors
 
 
 def load_x_posts(path: str | Path) -> list[dict]:
@@ -109,7 +148,7 @@ def load_x_posts(path: str | Path) -> list[dict]:
     if not isinstance(top_replies, list):
         raise ValueError("顶层 replies 应为回复数组（list）")
 
-    out = []
+    out: list[dict] = []
     for i, raw in enumerate(posts):
         if not isinstance(raw, dict):
             raise ValueError(f"第 {i} 条不是对象")
@@ -120,6 +159,7 @@ def load_x_posts(path: str | Path) -> list[dict]:
                 raise ValueError(f"第 {i} 条缺必填字段 {f}")
         out.append(normalize_x_post(raw, users=users))
 
+    result = XPostsResult(out)
     if top_replies:
-        _attach_top_replies(posts, out, top_replies)
-    return out
+        result.errors.extend(_attach_top_replies(posts, out, top_replies))
+    return result

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,17 +29,17 @@ DEFAULT_THEMES = [
     {"id": "mcp", "label": "MCP", "query": "topic:mcp"},
     {"id": "ai_agent", "label": "AI agent", "query": "topic:ai-agents"},
     {"id": "ai_coding", "label": "AI coding tools",
-     "query": 'topic:ai-coding OR "AI coding" in:description'},
+     "queries": ["topic:ai-coding", '"AI coding" in:description']},
     {"id": "ai_automation", "label": "AI automation",
      "query": 'topic:automation AI in:description'},
     {"id": "ai_video", "label": "AI video generation",
-     "query": 'topic:ai-video OR "video generation" in:description'},
+     "queries": ["topic:ai-video", '"video generation" in:description']},
     {"id": "ai_app_dev", "label": "AI app dev",
-     "query": 'topic:vibe-coding OR "app builder" in:description'},
+     "queries": ["topic:vibe-coding", '"app builder" in:description']},
     {"id": "side_hustle", "label": "side-hustle tools（副业工具）",
-     "query": 'topic:side-hustle OR "side project" in:description'},
+     "queries": ["topic:side-hustle", '"side project" in:description']},
     {"id": "beginner", "label": "beginner-usable open source",
-     "query": 'topic:no-code OR "beginner friendly" in:description'},
+     "queries": ["topic:no-code", '"beginner friendly" in:description']},
 ]
 
 PAID_KEYWORDS = ["paid", "api key", "openai api", "anthropic api", "subscription",
@@ -67,11 +68,14 @@ def load_config(path: str | Path | None = None) -> dict:
     themes = data.get("themes") or DEFAULT_THEMES
     normalized = []
     for t in themes:
-        if isinstance(t, dict) and t.get("query"):
+        if not isinstance(t, dict):
+            continue
+        queries = _theme_queries(t)
+        if queries:
             normalized.append({
                 "id": t.get("id") or t.get("label") or "theme",
                 "label": t.get("label") or t.get("id") or "theme",
-                "query": str(t["query"]),
+                "queries": queries,
             })
     return {
         "top": data.get("top"),
@@ -101,9 +105,35 @@ def _request_text(url: str, *, token=None, timeout=20) -> str:
     return resp.text or ""
 
 
-def _theme_query(theme: dict, since: str) -> str:
-    query = theme["query"]
-    if "pushed:" not in query:
+def _theme_queries(theme: dict) -> list[str]:
+    """返回主题下的独立查询列表；兼容旧单字段 query。
+
+    GitHub 仓库搜索不支持 `A OR B in:description`，因此即使旧配置仍用单个
+    query 字段，也按 OR 拆成多条独立查询。
+    """
+    raw = theme.get("queries") if isinstance(theme, dict) else None
+    if isinstance(raw, list):
+        queries = [str(q).strip() for q in raw if str(q or "").strip()]
+    elif isinstance(raw, str):
+        queries = [raw.strip()] if raw.strip() else []
+    else:
+        query = theme.get("query") if isinstance(theme, dict) else ""
+        queries = [str(query).strip()] if str(query or "").strip() else []
+    split: list[str] = []
+    for query in queries:
+        parts = [p.strip() for p in re.split(r"\s+OR\s+", query,
+                                             flags=re.IGNORECASE)]
+        split.extend(p for p in parts if p)
+    return split
+
+
+def _theme_query(theme_or_query, since: str) -> str:
+    if isinstance(theme_or_query, dict):
+        queries = _theme_queries(theme_or_query)
+        query = queries[0] if queries else ""
+    else:
+        query = str(theme_or_query or "")
+    if query and "pushed:" not in query:
         query = f"{query} pushed:>{since}"
     return query
 
@@ -252,22 +282,30 @@ def fetch_github(top: int = 5, themes: list[dict] | None = None, *,
     per_theme: dict[str, int] = {}
 
     for theme in themes:
-        query = _theme_query(theme, since)
-        try:
-            payload = _request_json(
-                f"{API_BASE}/search/repositories",
-                params={"q": query, "sort": "stars", "order": "desc",
-                        "per_page": max(top, 5)},
-                token=token, timeout=timeout)
-            api_calls += 1
-            repos = payload.get("items") if isinstance(payload, dict) else []
-            repos = [r for r in (repos or []) if isinstance(r, dict)]
-            per_theme[theme["id"]] = len(repos)
-            candidates.append((theme, repos))
-        except Exception as exc:  # noqa: BLE001 - 单主题失败不影响其他主题
-            errors.append(f"主题 {theme.get('label') or theme.get('id')} 检索失败："
-                          f"{type(exc).__name__}: {exc}")
-            per_theme[theme["id"]] = 0
+        theme_id = theme.get("id") or theme.get("label") or "theme"
+        theme_label = theme.get("label") or theme_id
+        repos_by_name: dict[str, dict] = {}
+        for raw_query in _theme_queries(theme):
+            query = _theme_query(raw_query, since)
+            try:
+                payload = _request_json(
+                    f"{API_BASE}/search/repositories",
+                    params={"q": query, "sort": "stars", "order": "desc",
+                            "per_page": max(top, 5)},
+                    token=token, timeout=timeout)
+                api_calls += 1
+                repos = payload.get("items") if isinstance(payload, dict) else []
+                for repo in repos or []:
+                    if not isinstance(repo, dict):
+                        continue
+                    full_name = str(repo.get("full_name") or "")
+                    if full_name and full_name not in repos_by_name:
+                        repos_by_name[full_name] = repo
+            except Exception as exc:  # noqa: BLE001 - 单查询失败不影响其他查询
+                errors.append(f"主题 {theme_label} 检索失败（{raw_query}）："
+                              f"{type(exc).__name__}: {exc}")
+        per_theme[theme_id] = len(repos_by_name)
+        candidates.append((theme, list(repos_by_name.values())))
 
     selected = _round_robin(candidates, top)
     snapshots = load_snapshots(snapshots_path)

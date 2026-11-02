@@ -94,19 +94,25 @@ def _parse_rss(xml_text: str) -> list[dict]:
     return entries
 
 
-def _fetch_rss(source: dict, limit: int, timeout: int) -> tuple[list[dict], int]:
+def _fetch_rss(source: dict, limit: int,
+               timeout: int) -> tuple[list[dict], int, list[str]]:
     url = source.get("url")
     if not url:
         raise ValueError("rss 源缺少 url")
     resp = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
     resp.raise_for_status()
+    # requests 对无 charset 的响应默认 ISO-8859-1，会把中文解成乱码。
+    encoding = getattr(resp, "encoding", None)
+    if not encoding or str(encoding).lower() in {"iso-8859-1", "latin-1", "latin1"}:
+        resp.encoding = getattr(resp, "apparent_encoding", None) or "utf-8"
     entries = _parse_rss(resp.text)[:limit]
+    warnings = [] if entries else ["解析到0条"]
     items = []
     for entry in entries:
         entry.setdefault("extra", {})
         entry["extra"].update({"feed_type": "rss"})
         items.append(normalize_official_item(entry, source))
-    return items, 1
+    return items, 1, warnings
 
 
 def _fetch_github_releases(source: dict, limit: int, timeout: int,
@@ -162,15 +168,19 @@ def fetch_official(sources: list[dict] | None = None, *,
         limit = int(source.get("limit") or default_limit)
         try:
             kind = source.get("type")
+            warnings: list[str] = []
             if kind == "rss":
-                got, calls = _fetch_rss(source, limit, timeout)
+                got, calls, warnings = _fetch_rss(source, limit, timeout)
             elif kind == "github_releases":
                 got, calls = _fetch_github_releases(source, limit, timeout, token)
             else:
                 raise ValueError(f"未知官方源类型：{kind}")
             items.extend(got)
             api_calls += calls
-            per_source[sid] = {"items": len(got), "errors": 0,
+            for warning in warnings:
+                errors.append({"source": source.get("name") or sid,
+                               "source_id": sid, "error": warning})
+            per_source[sid] = {"items": len(got), "errors": len(warnings),
                                "name": source.get("name")}
         except Exception as exc:  # noqa: BLE001 - 单源失败隔离
             name = source.get("name") or sid

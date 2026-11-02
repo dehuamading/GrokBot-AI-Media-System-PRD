@@ -50,22 +50,33 @@ github:
       query: "topic:ai-agents"
     - id: ai_coding
       label: AI coding tools
-      query: 'topic:ai-coding OR "AI coding" in:description'
+      # GitHub 仓库搜索不支持 A OR B in:description；每条查询独立检索后合并
+      queries:
+        - 'topic:ai-coding'
+        - '"AI coding" in:description'
     - id: ai_automation
       label: AI automation
       query: 'topic:automation AI in:description'
     - id: ai_video
       label: AI video generation
-      query: 'topic:ai-video OR "video generation" in:description'
+      queries:
+        - 'topic:ai-video'
+        - '"video generation" in:description'
     - id: ai_app_dev
       label: AI app dev
-      query: 'topic:vibe-coding OR "app builder" in:description'
+      queries:
+        - 'topic:vibe-coding'
+        - '"app builder" in:description'
     - id: side_hustle
       label: side-hustle tools（副业工具）
-      query: 'topic:side-hustle OR "side project" in:description'
+      queries:
+        - 'topic:side-hustle'
+        - '"side project" in:description'
     - id: beginner
       label: beginner-usable open source
-      query: 'topic:no-code OR "beginner friendly" in:description'
+      queries:
+        - 'topic:no-code'
+        - '"beginner friendly" in:description'
 
 # ===== 阶段2-B：官方源（≤5，URL/仓库均放配置，不写死在代码） =====
 # 2026-11-02 curl 验证：OpenAI RSS 200、Google AI RSS 200、

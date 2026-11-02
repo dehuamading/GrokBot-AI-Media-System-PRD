@@ -42,6 +42,27 @@ def test_aggregate_usage_without_usage_marks_cost_basis_unknown():
     assert agg["cost_basis"] == UNKNOWN
 
 
+def test_dry_run_with_live_still_writes_cost_log(tmp_path, monkeypatch):
+    from src.workflows import run
+
+    out = {"materials": [], "dropped": [], "x_posts": 0, "accounts": [],
+           "per_source": {}, "source_errors": {},
+           "external_calls": {"github": 0, "aihot": 1, "official": 0,
+                              "x": 0, "import": 0},
+           "validation_error_counts": {}}
+    monkeypatch.setattr(run.pipeline, "step_collect", lambda *a, **kw: out)
+    monkeypatch.setattr(run.pipeline, "step_analyze",
+                        lambda *a, **kw: {"cards": [], "details": []})
+    args = SimpleNamespace(
+        state=str(tmp_path / "state.json"), dry_run=True, live=True,
+        audience=None, aihot_file=None, x_following=None, x_posts=None,
+        sources="aihot", github_top=5, official_limit=3, import_file=None,
+        config=None, analyze="heuristic", shortlist=60, top_k=8,
+        page_id="root")
+    assert run.cmd_collect(args) == 0
+    assert (tmp_path / "cost_log.jsonl").exists()
+
+
 def test_collect_cost_log_writes_cost_basis(tmp_path):
     chat = FakeChat([{
         "provider": "opencode-go",

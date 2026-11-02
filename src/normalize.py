@@ -145,6 +145,9 @@ def normalize_github_item(raw: dict, github_extra: dict | None = None) -> dict:
     license_raw = raw.get("license") or {}
     license_name = (license_raw.get("spdx_id") or license_raw.get("name")
                     or "未标注")
+    spdx = str(license_raw.get("spdx_id") or "").strip()
+    license_label = spdx if spdx and spdx.upper() not in {
+        "NOASSERTION", "NONE"} else "未知"
     html_url = raw.get("html_url") or ""
     pushed = raw.get("pushed_at") or raw.get("updated_at") or None
 
@@ -164,6 +167,8 @@ def normalize_github_item(raw: dict, github_extra: dict | None = None) -> dict:
         "target_users": [],
         "worth_video": "待验证（推测）",
         "language": raw.get("language"),
+        # 仓库元数据来自官方 REST，可信；description 仍是维护者自述。
+        "metadata_verified": True,
     }
     if github_extra:
         github.update(github_extra)
@@ -178,7 +183,7 @@ def normalize_github_item(raw: dict, github_extra: dict | None = None) -> dict:
         "title_or_summary": f"{full_name}：{description}" if description else full_name,
         "raw_reference": f"GitHub 官方 REST：{full_name}",
         "claims": [description] if description else [],
-        "evidence_status": "verified",
+        "evidence_status": "self_reported",
         "target_user_hypotheses": list(github.get("target_users") or []),
         "user_problem_evidence": [],
         "tool_or_method": topics,
@@ -189,7 +194,7 @@ def normalize_github_item(raw: dict, github_extra: dict | None = None) -> dict:
         "keywords": topics,
         "comments": [],
         "metrics": {"stars": stars},
-        "license_status": "公开",
+        "license_status": f"公开+许可证:{license_label}",
         "errors": [],
         "extra": {"github": github},
     }
@@ -267,7 +272,8 @@ def normalize_x_post(raw: dict, users: dict | None = None) -> dict:
     2) X API 原样格式：data[] 条目（author_id + public_metrics + conversation_id），
        作者由 users（includes.users 的 id→user 映射）补全。
 
-    - source_url 原样使用文件里的 url；缺失时留空并记入 errors（不凭空拼接 URL）；
+    - source_url 原样使用文件里的 url；缺失时若 username 与 id 齐备，则构造
+      x.com 可追溯链接并在 extra 标注 url_constructed=true，否则留空记入 errors；
     - 证据等级 self_reported：帖子是作者自述，未交叉核验；
     - 互动数据同时保留在 extra（兼容旧消费方）与 metrics（新统一字段）。
     """
@@ -323,9 +329,16 @@ def normalize_x_post(raw: dict, users: dict | None = None) -> dict:
                     if isinstance(h, dict) and h.get("tag")]
 
     source_url = raw.get("url") or raw.get("source_url") or ""
+    url_constructed = False
+    if not source_url and username and raw.get("id"):
+        # X API 原样格式无 url，但 username 与 id 齐备时可稳定构造可追溯链接。
+        # x.com 仅用于拼接本地素材的可追溯链接，不是网络访问端点。
+        source_url = urlunsplit(("https", "x.com",
+                                 f"/{username}/status/{raw['id']}", "", ""))
+        url_constructed = True
     errors = list(raw.get("errors")) if isinstance(raw.get("errors"), list) else []
     if not source_url:
-        errors.append("缺少 url（未拼接 x.com 链接，避免生成未验证来源）")
+        errors.append("缺少 url（无法用 username+id 构造）")
     if not author:
         errors.append("缺少作者信息")
 
@@ -365,6 +378,7 @@ def normalize_x_post(raw: dict, users: dict | None = None) -> dict:
             "quotes": quotes,
             "impressions": impressions,
             "links": links,
+            "url_constructed": url_constructed,
         },
     }
 
@@ -378,13 +392,15 @@ def normalize_x_reply(raw: dict) -> dict:
     api_metrics = raw.get("public_metrics") if isinstance(
         raw.get("public_metrics"), dict) else {}
 
+    def scalar(value):
+        return None if isinstance(value, (list, dict)) else value
+
     def value(flat_key: str, api_key: str):
-        if flat_key in metrics and metrics[flat_key] is not None:
-            return metrics[flat_key]
-        if flat_key in raw and raw[flat_key] is not None:
-            return raw[flat_key]
-        if api_key in api_metrics and api_metrics[api_key] is not None:
-            return api_metrics[api_key]
+        for candidate in (metrics.get(flat_key), raw.get(flat_key),
+                          api_metrics.get(api_key)):
+            candidate = scalar(candidate)
+            if candidate is not None:
+                return candidate
         return 0
 
     return {
@@ -418,7 +434,7 @@ def _x_reply_parent(raw: dict) -> str:
         value = raw.get(key)
         if value:
             return str(value)
-    refs = raw.get("referenced_tweets") or raw.get("referenced_tones") or []
+    refs = raw.get("referenced_tweets") or []
     if isinstance(refs, list):
         for ref in refs:
             if not isinstance(ref, dict):
@@ -451,15 +467,24 @@ def dedupe(items: list[dict]) -> tuple[list[dict], list[str]]:
     return out, dropped
 
 
+def _has_missing_url_error(errors) -> bool:
+    for err in errors or []:
+        text = str(err)
+        if "缺少 url" in text or "缺少 source_url" in text:
+            return True
+    return False
+
+
 def validate_item(item: dict) -> list[str]:
     """校验素材是否满足 PRD 最小字段与枚举约束，返回错误列表。"""
     errors = []
     for f in REQUIRED_FIELDS:
         if f not in item or item[f] in (None, ""):
-            # X API 原样文件可能无 url；此时 normalize_x_post 留空并写入 errors，
-            # 由用户/下游显式看到缺失，而不是凭空拼接来源链接。
+            # X API 原样文件可能无 url；仅当 errors 明确说明缺少 url/source_url
+            # 时豁免，避免任意错误（如缺少作者）掩盖来源缺失。
             if (f == "source_url" and item.get("source_type") == "x_posts"
-                    and item.get("platform") == "x" and item.get("errors")):
+                    and item.get("platform") == "x"
+                    and _has_missing_url_error(item.get("errors"))):
                 continue
             if not (f == "published_at" and item.get("published_at") is None):
                 errors.append(f"缺少必填字段: {f}")

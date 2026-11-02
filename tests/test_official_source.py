@@ -125,3 +125,51 @@ def test_one_source_failure_does_not_break_others(monkeypatch):
     assert out["per_source"]["bad"]["items"] == 0
     assert out["per_source"]["good"]["items"] == 2
     assert out["errors"] and "坏源" in out["errors"][0]["source"]
+
+
+RSS_ZH = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+<item><title>中文标题：免费本地运行教程</title><link>https://example.com/zh/1</link>
+<pubDate>Tue, 28 Oct 2026 10:00:00 GMT</pubDate><description>中文摘要内容</description></item>
+</channel></rss>"""
+
+RSS_EMPTY = """<?xml version="1.0"?>
+<rss version="2.0"><channel><title>空源</title></channel></rss>"""
+
+
+class CharsetlessResponse:
+    """模拟 requests 在响应头无 charset 时默认 ISO-8859-1 的行为。"""
+
+    def __init__(self, content: bytes):
+        self.content = content
+        self.status_code = 200
+        self.encoding = None
+        self.apparent_encoding = "utf-8"
+
+    @property
+    def text(self):
+        return self.content.decode(self.encoding or "ISO-8859-1")
+
+    def raise_for_status(self):
+        return None
+
+
+def test_rss_without_charset_decodes_chinese_as_utf8(monkeypatch):
+    def fake_get(url, params=None, headers=None, timeout=None, **kw):
+        return CharsetlessResponse(RSS_ZH.encode("utf-8"))
+
+    monkeypatch.setattr(official_source.requests, "get", fake_get)
+    sources = [{"id": "zh", "name": "中文源", "type": "rss",
+                "url": "https://example.com/zh.xml", "limit": 1}]
+    out = fetch_official(sources)
+    assert out["items"][0]["title_or_summary"].startswith("中文标题")
+
+
+def test_rss_zero_items_records_error(monkeypatch):
+    monkeypatch.setattr(official_source.requests, "get",
+                        _fake_get(text=RSS_EMPTY))
+    sources = [{"id": "empty", "name": "空源", "type": "rss",
+                "url": "https://example.com/empty.xml", "limit": 3}]
+    out = fetch_official(sources)
+    assert out["items"] == []
+    assert any("解析到0条" in e["error"] for e in out["errors"])

@@ -83,6 +83,21 @@ def test_csv_comments_pipe_and_multirow_same_url_merge(tmp_path):
     assert out["dropped_duplicates"] == 1
 
 
+def test_invalid_authorization_status_is_logged(tmp_path):
+    bad = tmp_path / "bad_auth.json"
+    bad.write_text(json.dumps({"items": [{
+        "platform": "douyin", "original_url": "https://example.com/bad-auth",
+        "title": "非法授权状态（假数据）",
+        "published_at": "2026-10-20T10:00:00Z",
+        "authorization_status": "随便授权",
+    }]}, ensure_ascii=False), encoding="utf-8")
+    errlog = tmp_path / "err.jsonl"
+    out = load_import_file(bad, errors_path=errlog)
+    assert out["items"] == []
+    assert out["errors"] and "authorization_status" in out["errors"][0]["error"]
+    assert errlog.read_text(encoding="utf-8").strip()
+
+
 def test_classify_comment_demand_stub_categories():
     tags = classify_comment_demand("国内能用吗？有没有免费替代，安装报错怎么办")
     assert "国内使用" in tags
