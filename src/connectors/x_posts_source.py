@@ -45,15 +45,33 @@ def _parse_payload(data) -> tuple[list, list, dict, bool]:
         return data, [], {}, False
     if not isinstance(data, dict):
         raise ValueError("X 帖子文件应为数组或对象")
+    includes = data.get("includes") if isinstance(data.get("includes"), dict) else {}
+    includes_replies = (includes.get("replies")
+                        if isinstance(includes.get("replies"), list) else [])
     if isinstance(data.get("posts"), list):
         posts = data["posts"]
-        replies = data.get("replies") or []
+        replies = list(data.get("replies") or []) + includes_replies
         return posts, replies, _users_map(data), False
     # X API 原样：data 必须非空，避免把任意 {"data": []} 误当合法输入。
     if isinstance(data.get("data"), list) and data["data"]:
-        replies = data.get("replies") or []
+        replies = list(data.get("replies") or []) + includes_replies
         return data["data"], replies, _users_map(data), True
     raise ValueError("X 帖子文件应为扁平数组、{\"posts\": [...]} 或 X API data[] 格式")
+
+
+def _extract_replies_payload(data) -> tuple[list, dict]:
+    """从 X API 原样回复文件提取 replies 与 includes.users（--x-replies-file）。"""
+    if isinstance(data, list):
+        return data, {}
+    if not isinstance(data, dict):
+        raise ValueError("X 回复文件应为数组或对象")
+    includes = data.get("includes") if isinstance(data.get("includes"), dict) else {}
+    replies = data.get("replies")
+    if not isinstance(replies, list):
+        replies = includes.get("replies")
+    if not isinstance(replies, list):
+        replies = data.get("data") if isinstance(data.get("data"), list) else []
+    return replies, _users_map(data)
 
 
 def _has_reply_marker(raw: dict) -> bool:
@@ -136,8 +154,12 @@ def _attach_top_replies(posts_raw: list[dict], items: list[dict],
     return errors
 
 
-def load_x_posts(path: str | Path) -> list[dict]:
-    """读取 X 帖子文件并归一化为统一素材格式（纯本地，无网络）。"""
+def load_x_posts(path: str | Path, replies_path: str | Path | None = None) -> list[dict]:
+    """读取 X 帖子文件并归一化为统一素材格式（纯本地，无网络）。
+
+    replies_path：可选的 X API 原样回复文件（data/includes/replies/meta），
+    回复按 conversation_id / parent id 挂到对应帖子 comments。
+    """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"X 帖子文件不存在：{p}")
@@ -147,6 +169,14 @@ def load_x_posts(path: str | Path) -> list[dict]:
         raise ValueError("X 帖子文件应为帖子数组（list）")
     if not isinstance(top_replies, list):
         raise ValueError("顶层 replies 应为回复数组（list）")
+    if replies_path:
+        rp = Path(replies_path)
+        if not rp.exists():
+            raise FileNotFoundError(f"X 回复文件不存在：{rp}")
+        extra_replies, extra_users = _extract_replies_payload(
+            json.loads(rp.read_text(encoding="utf-8")))
+        top_replies = list(top_replies) + list(extra_replies)
+        users = {**extra_users, **users}
 
     out: list[dict] = []
     for i, raw in enumerate(posts):

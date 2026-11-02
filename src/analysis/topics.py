@@ -11,7 +11,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from src.analysis.classify import classify_item
-from src.analysis.scoring import SCORING_VERSION, score_item
+from src.analysis.demand import short_evidence_texts
+from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,
+                                  score_item, score_item_v3)
 
 # 内容类型 → (标题模板, 建议平台)。建议平台是初始假设，用户可在关口改。
 TYPE_TEMPLATES = {
@@ -45,34 +47,46 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
     now = now or datetime.now(timezone.utc)
     details = []
     for it in materials:
+        # 原始来源必须是素材 source_url；缺失则不出卡（不编造来源）。
+        if not (it.get("source_url") or "").strip():
+            continue
         ctype, creason = classify_item(it)
         sc = score_item(it, now=now, profile=profile)
+        v3 = score_item_v3(it, now=now, profile=profile)
         details.append({"item": it, "content_type": ctype, "classify_reason": creason,
-                        "score": sc})
+                        "score": sc, "v3": v3})
     details.sort(key=lambda d: (-d["score"]["total"], d["item"]["item_id"]))
 
     top_k = min(top_k, 10)
     cards: list[dict] = []
     for i, d in enumerate(details[:top_k], start=1):
         it, sc, ctype = d["item"], d["score"], d["content_type"]
+        v3 = d["v3"]
         title_tpl, platform = TYPE_TEMPLATES[ctype]
         weak = sorted(sc["dimensions"], key=lambda x: x["points"])[:2]
         weakest_txt = "；".join(f"{w['name']}({w['grade']}：{w['reason']})" for w in weak)
         strong = next(x for x in sc["dimensions"] if x["name"] == "信息可信度")
         cost = next(x for x in sc["dimensions"] if x["name"] == "制作成本")
         audience = AUDIENCE_BY_TYPE[ctype]
+        why_now = (d["score"]["dimensions"][3]["reason"]
+                   or "未取得发布时间") + "；事件仍在关注窗口内"
+        evidence = short_evidence_texts(it)
+        if evidence:
+            demand_text = ("评论证据（脱敏，≤3条）："
+                           + "；".join(f"「{e}」" for e in evidence))
+        else:
+            demand_text = ("待验证：本轮素材池无直接用户需求证据（无评论/帖子数据）；"
+                           f"仅假设「{audience}」关心此类内容，须在文案阶段或评论区补证")
         cards.append({
             "topic_id": f"T-{now.strftime('%Y%m%d')}-{i:03d}",
             "拟定标题": title_tpl.format(title=(it.get("title_or_summary") or "")[:60]),
             "建议平台": platform,
             "面向谁": f"{audience}；他们想解决：{_audience_problem(ctype)}",
             "核心价值": f"用一条内容讲清「{ctype}」：{(it.get('title_or_summary') or '')[:50]}",
-            "为什么现在": (d["score"]["dimensions"][3]["reason"]
-                          or "未取得发布时间") + "；事件仍在关注窗口内",
+            "为什么现在": why_now,
             "关联素材": [it["item_id"]],
             "_source_urls": [it["source_url"]] if it.get("source_url") else [],
-            "需求证据": "待验证：本轮素材池无直接用户需求证据（无评论/帖子数据）；"
-                        f"仅假设「{audience}」关心此类内容，须在文案阶段或评论区补证",
+            "需求证据": demand_text,
             "可信度与风险": f"证据等级 {it.get('evidence_status')}（{strong['reason']}）；"
                            f"风险：二手转述可能失真，引用前须打开原始链接核验",
             "最强反证": f"最弱两维 → {weakest_txt}；此外若该消息已被大量账号报道，"
@@ -84,8 +98,46 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
                       + "；".join(f"{x['name']}{x['grade']}" for x in sc["dimensions"]),
             "内容类型": ctype,
             "用户选择结果": "待用户选择",
+            # 阶段3 新字段（只增不改旧字段；空/未知统一「待验证」）
+            "类型": v3["type"],
+            "选题类型": v3["type"],
+            "面向用户": audience,
+            "痛点或机会": _audience_problem(ctype),
+            "原始来源": it["source_url"],
+            "为何现在做": why_now,
+            "国内可用": _china_label(v3),
+            "是否付费": _paid_label((it.get("title_or_summary") or "")
+                                   + " " + " ".join(it.get("claims") or [])),
+            "能否实际验证": "可验证：有原始出处链接" if it.get("source_url") else "待验证",
+            "切入角度": f"用一条内容讲清「{ctype}」",
+            "主要风险": f"证据等级 {it.get('evidence_status')}（{strong['reason']}）；"
+                       f"风险：二手转述可能失真，引用前须打开原始链接核验",
+            "评分版本": SCORING_VERSION_V3,
+            "轨道得分": v3["track_score"],
+            "副业证据等级": v3["side_hustle_evidence_level"],
+            "传播潜力假设(不计分)": v3["propagation_hypothesis"]["text"],
+            "综合评分": v3["total"],
+            "_v3": v3,
         })
     return cards, details
+
+
+def _china_label(v3: dict) -> str:
+    if v3.get("china_pending"):
+        return "待验证"
+    dim = next((d for d in v3["dimensions"] if d["name"] == "国内适用性"), None)
+    if dim is None:
+        return "待验证"
+    return {2: "可用", 1: "需梯子或外币卡", 0: "不可用"}.get(dim["points"], "待验证")
+
+
+def _paid_label(text: str) -> str:
+    lowered = (text or "").lower()
+    if any(k in lowered for k in ("免费", "开源", "试用", "白嫖")):
+        return "免费/开源（额度待验证）"
+    if any(k in lowered for k in ("订阅", "付费", "收费", "价格", "会员")):
+        return "可能需付费（待验证）"
+    return "待验证"
 
 
 def _audience_problem(ctype: str) -> str:

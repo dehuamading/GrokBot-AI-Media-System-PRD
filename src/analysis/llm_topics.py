@@ -19,9 +19,19 @@ import re
 from datetime import datetime, timezone
 
 from src.analysis.audience import AudienceProfile, match_audience
+from src.analysis.demand import short_evidence_texts
+from src.analysis.scoring import SCORING_VERSION_V3, score_item_v3
 from src.llm.glm import GLMChat, GLMParseError
 
 ENGLISH_STOP = re.compile(r"[a-zA-Z]")
+
+
+def _chat_json(chat, system: str, user: str, **kw) -> dict:
+    """兼容只接受 (system, user) 的测试/第三方客户端。"""
+    try:
+        return chat.chat_json(system, user, **kw)
+    except TypeError:
+        return chat.chat_json(system, user)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +103,8 @@ def _post_block(n: int, m: dict, with_url: bool = False) -> str:
 
 
 def glm_score_posts(chat: GLMChat, materials: list[dict],
-                    profile: AudienceProfile, batch: int = 10) -> dict[str, dict]:
+                    profile: AudienceProfile, batch: int = 10,
+                    preference_text: str = "") -> dict[str, dict]:
     """GLM 分批打分。返回 {item_id: {"score": float, "reason": str}}。单批解析失败重试一次。"""
     out: dict[str, dict] = {}
     for start in range(0, len(materials), batch):
@@ -103,12 +114,15 @@ def glm_score_posts(chat: GLMChat, materials: list[dict],
         lines = [f"{_post_block(i + 1, m)}" for i, m in enumerate(chunk)]
         user = (f"受众画像：{profile.summary()}\n\n帖子列表（共 {len(chunk)} 条）：\n"
                 + "\n".join(lines))
+        system = SCORE_SYSTEM
+        if preference_text:
+            system += f"\n\n【用户偏好参考（仅参考）】\n{preference_text}"
         data = None
         for attempt in range(2):
             try:
-                data = chat.chat_json(SCORE_SYSTEM, user,
-                                      temperature=0.1 if attempt else 0.2,
-                                      max_tokens=8000)
+                data = _chat_json(chat, system, user,
+                                  temperature=0.1 if attempt else 0.2,
+                                  max_tokens=8000)
                 break
             except GLMParseError:  # noqa: PERF203
                 if attempt:
@@ -149,7 +163,8 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
                     profile: AudienceProfile, now: datetime | None = None,
                     glm_scores: dict[str, dict] | None = None,
                     min_cards: int = 5, max_cards: int = 8,
-                    pool_size: int = 16) -> tuple[list[dict], dict]:
+                    pool_size: int = 16, preference_text: str = "",
+                    card_type: str | None = None) -> tuple[list[dict], dict]:
     """GLM 撰写选题卡 → 硬校验 → 组装为 PRD 5.4 卡片结构。
 
     返回 (cards, meta)；meta 含 glm_model/calls/insufficient/dropped 等审计信息。
@@ -169,13 +184,20 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
     data, last_err = None, None
     for attempt in range(3):
         sys_prompt = CARD_SYSTEM
+        if preference_text:
+            sys_prompt += f"\n\n【用户偏好参考（仅参考）】\n{preference_text}"
+        if card_type in ("需求型", "机会型"):
+            sys_prompt += (f"\n本批只生成「{card_type}」卡；"
+                           + ("需求型卡必须引用评论原文证据（refs 指向含评论的素材）。"
+                              if card_type == "需求型"
+                              else "机会型卡来自 aihot/github/official/X 帖子。"))
         if attempt:
             sys_prompt += ("\n再次提醒：不要输出任何推理过程或 JSON 以外的文字，"
                            "直接以 { 开头、以 } 结尾输出完整 JSON；卡片数可减到下限。")
         try:
-            data = chat.chat_json(sys_prompt, user,
-                                  temperature=0.4 if attempt == 0 else 0.2,
-                                  max_tokens=12000)
+            data = _chat_json(chat, sys_prompt, user,
+                              temperature=0.4 if attempt == 0 else 0.2,
+                              max_tokens=12000)
             break
         except GLMParseError as e:  # 截断/夹带文本 → 降温重就（最多 3 次）
             last_err = e
@@ -186,7 +208,8 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
     seen_titles: set[str] = set()
     for raw in (data.get("cards") or [])[: max_cards + 4]:
         card, why_drop = _assemble_card(raw, by_n, profile, now,
-                                        glm_scores or {}, len(cards) + 1)
+                                        glm_scores or {}, len(cards) + 1,
+                                        default_type=card_type)
         if card is None:
             dropped.append(why_drop)
             continue
@@ -200,8 +223,8 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
             break
     cards.sort(key=lambda c: -c["综合评分"])
     meta = {
-        "engine": f"glm:{chat.model}",
-        "glm_calls": chat.calls,
+        "engine": f"glm:{getattr(chat, 'model', 'unknown')}",
+        "glm_calls": getattr(chat, "calls", 0),
         "pool": len(materials), "cards": len(cards),
         "dropped": dropped,
         "insufficient": len(cards) < min_cards,
@@ -210,7 +233,8 @@ def glm_build_cards(chat: GLMChat, materials: list[dict],
 
 
 def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
-                   now: datetime, glm_scores: dict, seq: int) -> tuple[dict | None, str]:
+                   now: datetime, glm_scores: dict, seq: int,
+                   default_type: str | None = None) -> tuple[dict | None, str]:
     """把 LLM 原始卡组装为完整卡片；字段缺失/引用非法 → (None, 丢弃原因)。"""
     title = str(raw.get("title") or "").strip()
     why = str(raw.get("why_fit") or "").strip()
@@ -232,6 +256,31 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         return None, f"refs 数量非法（有效 {len(refs)}，须 1-3）"
     mats = [by_n[r] for r in refs]
 
+    source_urls = [m.get("source_url") for m in mats if m.get("source_url")]
+    if not source_urls:
+        return None, "缺原始来源（素材无 source_url）"
+
+    demand_evidence: list[str] = []
+    for m in mats:
+        for text in short_evidence_texts(m):
+            if text not in demand_evidence:
+                demand_evidence.append(text)
+        if len(demand_evidence) >= 3:
+            break
+    demand_evidence = demand_evidence[:3]
+    chosen_type = str(raw.get("选题类型") or raw.get("type") or "").strip()
+    if chosen_type not in ("需求型", "机会型"):
+        if default_type in ("需求型", "机会型"):
+            chosen_type = default_type
+        else:
+            chosen_type = "需求型" if demand_evidence else "机会型"
+    if chosen_type == "需求型" and not demand_evidence:
+        return None, "需求型卡缺评论原文证据"
+
+    v3_primary = (next((m for m in mats if short_evidence_texts(m)), mats[0])
+                  if chosen_type == "需求型" else mats[0])
+    v3 = score_item_v3(v3_primary, now=now, profile=profile)
+
     try:
         score = max(0.0, min(10.0, float(raw.get("score") or 0)))
     except (TypeError, ValueError):
@@ -246,17 +295,21 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
     eng_total = sum(_engagement(m) for m in mats)
 
     item_ids = [m["item_id"] for m in mats]
+    why_now = f"来源帖子发布于近 24 小时窗口（最新 {latest or '待验证'}）；引用帖合计互动（赞+转+评+引）约 {eng_total}"
+    demand_text = ("评论证据（脱敏，≤3条）："
+                   + "；".join(f"「{e}」" for e in demand_evidence)
+                   if demand_evidence else
+                   "待验证：本轮引用素材无直接评论证据；须在文案阶段补证")
     return {
         "topic_id": f"TX-{now.strftime('%Y%m%d')}-{seq:03d}",
         "拟定标题": title,
         "建议平台": platform,
         "面向谁": f"{profile.name}（画像 {profile.profile_id}）；他们想解决：{profile.pain_points[0] if profile.pain_points else '待核实'}",
         "核心价值": hook,
-        "为什么现在": f"来源帖子发布于近 24 小时窗口（最新 {latest or '待核实'}）；引用帖合计互动（赞+转+评+引）约 {eng_total}",
+        "为什么现在": why_now,
         "关联素材": item_ids,
-        "_source_urls": [m["source_url"] for m in mats],
-        "需求证据": f"画像依据：用户提供的受众画像（{profile.profile_id}）；"
-                   f"间接信号：引用帖互动约 {eng_total}。无直接用户评论/提问证据 → 待验证",
+        "_source_urls": source_urls,
+        "需求证据": demand_text,
         "可信度与风险": f"{risk}；证据等级 self_reported（X 帖子为作者自述，引用前须打开原帖核验）",
         "最强反证": counter,
         "差异与难度": str(raw.get("difficulty") or "待核实"),
@@ -270,4 +323,28 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         "国内可用性": china,
         "引用帖子": cited,
         "用户选择结果": "待用户选择",
+        # 阶段3 新字段（只增不改旧字段；空/未知统一「待验证」）
+        "类型": chosen_type,
+        "选题类型": chosen_type,
+        "面向用户": _pending(raw.get("target_user")) or
+                  f"{profile.name}（画像 {profile.profile_id}）",
+        "痛点或机会": _pending(raw.get("pain_or_opportunity")) or why,
+        "原始来源": source_urls[0],
+        "为何现在做": _pending(raw.get("why_now")) or why_now,
+        "国内可用": _pending(raw.get("china")) or china,
+        "是否付费": _pending(raw.get("paid")),
+        "能否实际验证": _pending(raw.get("verifiable")) or
+                    ("可验证：有原始出处链接" if source_urls else "待验证"),
+        "切入角度": _pending(raw.get("angle")) or hook,
+        "主要风险": risk,
+        "评分版本": SCORING_VERSION_V3,
+        "轨道得分": v3["track_score"],
+        "副业证据等级": v3["side_hustle_evidence_level"],
+        "传播潜力假设(不计分)": v3["propagation_hypothesis"]["text"],
+        "_v3": v3,
     }, ""
+
+
+def _pending(value) -> str:
+    text = str(value or "").strip()
+    return text if text and text not in ("未知", "待核实", "待确认") else "待验证"

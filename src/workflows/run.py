@@ -7,6 +7,10 @@
   gate2     S6 读取 04 库各稿状态（只读观测；无发布动作）
   status    打印本地状态；--live 附带 Notion 关口实况
   selfcheck 连通性自检：aihot 1 条真实请求 + Notion 权限/结构检查 + 1 条审计
+  feedback  记录 GATE-1 反馈到 05（不改 03）
+  feedback-seed  从本地 JSON 批量写反馈
+  rules     候选规则：--propose 生成待确认规则；--confirm 只提示手动改状态
+  topics-round   选题轮：采集→需求分类→偏好注入→出卡→写 03/02→停 GATE-1
 
 通用：--dry-run 全程离线不写 Notion 不落状态；NOTION_TOKEN 只从环境变量读。
 """
@@ -16,12 +20,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.analysis.audience import load_profile  # noqa: E402
-from src.analysis.scoring import SCORING_VERSION  # noqa: E402
+from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,  # noqa: E402
+                                  merge_dual_tracks, score_item_v3)
 from src.connectors.github_source import (DEFAULT_SNAPSHOTS, fetch_github,  # noqa: E402
                                           load_config as load_github_config)
 from src.cost_log import UNKNOWN, append_cost  # noqa: E402
@@ -550,6 +556,512 @@ def cmd_sources_check(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ feedback/rules
+def _load_client_state(args, client=None):
+    state = WorkflowState(args.state).load()
+    client = client or NotionClient()
+    db_ids = state.get("db_ids") or ensure_kb(client, args.page_id)
+    ensure_kb_upgrades(client, db_ids)
+    state.update(db_ids=db_ids, page_root=args.page_id)
+    return state, client, db_ids
+
+
+def cmd_feedback(args, client=None) -> int:
+    """记录一条 GATE-1 反馈到 05（手动触发；绝不改 03）。"""
+    from src.analysis import preference
+    state, client, db_ids = _load_client_state(args, client)
+    round_no = getattr(args, "round", None)
+    if round_no is None:
+        round_no = state.get("round_id") or 1
+    feedback = {
+        "topic_id": args.topic,
+        "原始选题": getattr(args, "title", "") or "",
+        "推荐理由": getattr(args, "why", "") or "",
+        "用户选择": args.pick,
+        "原话反馈": args.say,
+        "原因标签": getattr(args, "reason", "") or "",
+        "轮次": round_no,
+        "下轮参考": getattr(args, "next", "") or "",
+        "time": iso_now(),
+    }
+    out = preference.record_feedback(client, db_ids, feedback)
+    state.save()
+    print(f"✅ 已写反馈：{out['feedback_id']}（类型=反馈，性质=用户偏好，状态=待验证）")
+    if out.get("approved_material_id"):
+        print(f"✅ 已写认可素材：{out['approved_material_id']}")
+    print("ℹ️ 未修改 03_选题决策 的任何卡状态；如需确认规则请到 Notion 手动操作。")
+    return 0
+
+
+def cmd_feedback_seed(args, client=None) -> int:
+    """从本地 JSON 批量写反馈（文件放 data/state，不入库）。"""
+    from src.analysis import preference
+    path = Path(args.file)
+    if not path.exists():
+        print(f"❌ 反馈文件不存在：{path}")
+        return 1
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        records = (data.get("items") or data.get("feedbacks")
+                   or data.get("records"))
+        if records is None and "topic_id" in data:
+            records = [data]
+    else:
+        records = data
+    if not isinstance(records, list):
+        print("❌ 反馈 JSON 应为数组或 {\"items\": [...]}")
+        return 1
+    _, client, db_ids = _load_client_state(args, client)
+    written = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        written.append(preference.record_feedback(client, db_ids, rec))
+    print(f"✅ 批量写入反馈 {len(written)} 条（幂等；已存在不重复）。")
+    return 0
+
+
+def cmd_rules(args, client=None) -> int:
+    """候选规则：--propose 生成待确认规则；--confirm 只提示用户手动改状态。"""
+    from src.analysis import preference
+    if getattr(args, "confirm", None):
+        record_id = args.confirm
+        print("请在 Notion 中由用户手动把状态改为正在使用"
+              f"（record_id={record_id}）。代码不会自动修改状态。")
+        return 0
+    if not getattr(args, "propose", False):
+        print("用法：rules --propose 或 rules --confirm <record_id>")
+        return 1
+    state, client, db_ids = _load_client_state(args, client)
+    if getattr(args, "propose", False):
+        chat = None
+        if getattr(args, "llm", "template") == "llm":
+            from src.llm.provider_chain import ProviderChain
+            chat = ProviderChain()
+        out = preference.propose_rules(client, db_ids, chat=chat)
+        if not out["proposed"]:
+            print(f"ℹ️ {out.get('reason')}（轮次：{out.get('rounds')}）")
+            return 0
+        print(f"✅ 已生成候选规则 {len(out['proposed'])} 条（类型=候选规则，状态=待确认，"
+              f"引擎={out['engine']}）：")
+        for rid in out["proposed"]:
+            print(f"  - {rid}")
+        print("⚠️ 候选规则仅供参考，绝不会自动生效；请在 Notion 中人工确认后"
+              "手动把状态改为「正在使用」。")
+        state.save()
+        return 0
+    print("用法：rules --propose 或 rules --confirm <record_id>")
+    return 1
+
+
+# --------------------------------------------------------------- topics-round
+def _flatten_demand_comments(materials: list[dict]) -> list[dict]:
+    flat = []
+    for m in materials:
+        for idx, comment in enumerate(m.get("comments") or []):
+            text = (comment.get("text") if isinstance(comment, dict)
+                    else str(comment or "")).strip()
+            if not text:
+                continue
+            flat.append({
+                "text": text,
+                "source_url": (comment.get("source_url") if isinstance(comment, dict)
+                               else "") or m.get("source_url", ""),
+                "item_id": m["item_id"],
+                "comment_index": idx,
+            })
+    return flat
+
+
+def _attach_demand_results(materials: list[dict], classified: list[dict]) -> None:
+    by_item = {m["item_id"]: m for m in materials}
+    for entry in classified:
+        m = by_item.get(entry.get("item_id"))
+        idx = entry.get("comment_index")
+        if m is None or idx is None:
+            continue
+        comments = m.get("comments") or []
+        if 0 <= idx < len(comments) and isinstance(comments[idx], dict):
+            comments[idx]["demand_tags"] = entry["tags"]
+        tags = m.setdefault("demand_tags", [])
+        for tag in entry["tags"]:
+            if tag not in tags:
+                tags.append(tag)
+        m.setdefault("demand_evidence", []).append({
+            "text": entry["text"], "tags": entry["tags"],
+            "source_url": entry.get("source_url", ""),
+        })
+
+
+def _write_preference_injection(state_dir: Path, text: str, now: datetime) -> Path:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / f"preference_injection_{now.strftime('%Y%m%dT%H%M%S')}.txt"
+    path.write_text(text or "（本轮无偏好注入）", encoding="utf-8")
+    return path
+
+
+def _log_topics_round_cost(args, chat, out: dict, *, demand_count: int,
+                           card_count: int) -> dict:
+    path = Path(args.state).parent / "cost_log.jsonl"
+    if chat is None:
+        stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                 "tokens": 0, "cost": 0,
+                 "cost_basis": "免费接口（未使用LLM）"}
+        provider, model = "无", "无"
+    else:
+        stats = _aggregate_usage(chat)
+        provider = getattr(chat, "last_provider", None) or getattr(chat, "model", UNKNOWN)
+        model = getattr(chat, "last_model", None) or getattr(chat, "model", UNKNOWN)
+    external = out.get("external_calls") if isinstance(out.get("external_calls"), dict) else {}
+    record = append_cost(path, {
+        "command": f"topics-round --round-id {getattr(args, 'round_id', '') or ''}",
+        "provider": provider, "model": model,
+        **stats,
+        "external_api_calls": external,
+        "note": (f"需求分类 {demand_count} 条；合并选题卡 {card_count} 张；"
+                 "cost 为接口返回 list_cost 时按套餐额度折算（非实付），未知写「未知」"),
+    })
+    print(f"[成本] provider={record['provider']} model={record['model']}；"
+          f"调用 {record['calls']} 次，tokens={record['tokens']}，"
+          f"金额={record['金额']}；成本口径={record['成本口径']}")
+    return record
+
+
+def _postprocess_round_cards(cards: list[dict], materials: list[dict], *,
+                             now: datetime, profile, max_cards: int,
+                             active_rules: list[str] | None = None) -> list[dict]:
+    from src.analysis.demand import (demand_evidence_for_item,
+                                     has_demand_evidence, short_evidence_texts)
+    mat_by_id = {m["item_id"]: m for m in materials}
+    allowed_opportunity = {"aihot", "github", "official", "x_posts"}
+    final: list[dict] = []
+    for c in cards:
+        mats = [mat_by_id[i] for i in c.get("关联素材") or [] if i in mat_by_id]
+        if not mats:
+            continue
+        ctype = c.get("_intended_type") or c.get("选题类型") or c.get("类型")
+        if ctype not in ("需求型", "机会型"):
+            ctype = ("需求型" if any(has_demand_evidence(m) for m in mats)
+                     else "机会型")
+        if ctype == "需求型":
+            evidence: list[str] = []
+            for m in mats:
+                for text in short_evidence_texts(m):
+                    if text not in evidence:
+                        evidence.append(text)
+            if not evidence:
+                continue  # 需求型卡必须引用评论原文证据
+            c["需求证据"] = ("评论证据（脱敏，≤3条）："
+                             + "；".join(f"「{t}」" for t in evidence[:3]))
+        else:
+            if not any(m.get("source_type") in allowed_opportunity
+                       or m.get("platform") in {"aihot", "github", "official", "x"}
+                       for m in mats):
+                continue  # 机会型卡必须来自 aihot/github/official/X 帖子
+        source_urls = [m["source_url"] for m in mats if m.get("source_url")]
+        if not source_urls:
+            continue
+        if ctype == "需求型":
+            demand_mats = [m for m in mats if has_demand_evidence(m)]
+            primary = demand_mats[0] if demand_mats else mats[0]
+            demand_ev = []
+            for m in demand_mats:
+                demand_ev.extend(demand_evidence_for_item(m))
+            v3 = score_item_v3(primary, now=now, profile=profile,
+                               demand=demand_ev, active_rules=active_rules)
+        else:
+            primary = mats[0]
+            v3 = score_item_v3(primary, now=now, profile=profile,
+                               active_rules=active_rules)
+        c["选题类型"] = ctype
+        c["类型"] = ctype
+        c["评分版本"] = SCORING_VERSION_V3
+        c["轨道得分"] = v3["adjusted_track_score"]
+        c["ranking_track_score"] = v3["adjusted_track_score"]
+        c["ranking_total"] = v3["adjusted_total"]
+        c["rule_adjustment"] = v3["rule_adjustment"]
+        c["副业证据等级"] = v3["side_hustle_evidence_level"]
+        c["传播潜力假设(不计分)"] = v3["propagation_hypothesis"]["text"]
+        c["综合评分"] = v3["adjusted_total"]
+        c["推荐级别"] = v3["level"]
+        base_reason = str(c.get("推荐理由") or "").strip()
+        v3_reason = (f"v3 总分 {v3['adjusted_total']}/18，轨道分 "
+                     f"{v3['adjusted_track_score']}")
+        if v3["rule_adjustment"]:
+            v3_reason += f"（已应用正在使用规则加减分 {v3['rule_adjustment']:+d}）"
+        c["推荐理由"] = (base_reason + "；" + v3_reason
+                         if base_reason else v3_reason)
+        c["面向用户"] = c.get("面向用户") or c.get("面向谁") or "待验证"
+        c["痛点或机会"] = c.get("痛点或机会") or c.get("核心价值") or "待验证"
+        c["原始来源"] = source_urls[0]
+        c["为何现在做"] = c.get("为何现在做") or c.get("为什么现在") or "待验证"
+        c["国内可用"] = c.get("国内可用") or c.get("国内可用性") or "待验证"
+        c["是否付费"] = c.get("是否付费") or "待验证"
+        c["能否实际验证"] = c.get("能否实际验证") or "待验证"
+        c["切入角度"] = c.get("切入角度") or c.get("切入角度与钩子") or "待验证"
+        c["主要风险"] = c.get("主要风险") or c.get("可信度与风险") or "待验证"
+        c["引用帖子"] = "；".join(source_urls)  # X 卡只放 url，不写用户名/正文全文
+        # X 来源卡：隐去作者名/用户名（引用帖子字段仍只放 url）
+        if any(m.get("platform") == "x" or m.get("source_type") == "x_posts"
+               for m in mats):
+            from src.analysis.demand import sanitize_evidence
+            names: set[str] = set()
+            for m in mats:
+                if m.get("platform") != "x" and m.get("source_type") != "x_posts":
+                    continue
+                author = str(m.get("author_or_publisher") or "").strip()
+                if author:
+                    names.add(author)
+                username = str((m.get("extra") or {}).get("author_username") or "")
+                if username:
+                    names.update({username, f"@{username}"})
+            for key in ("拟定标题", "面向用户", "痛点或机会", "为何现在做",
+                        "国内可用", "是否付费", "能否实际验证", "切入角度",
+                        "主要风险", "推荐理由", "核心价值"):
+                value = c.get(key)
+                if not isinstance(value, str):
+                    continue
+                for name in names:
+                    if name:
+                        value = value.replace(name, "（已隐去）")
+                if key == "拟定标题":
+                    value = sanitize_evidence(value, limit=60)
+                c[key] = value
+            # 若标题直接照搬帖子正文（常见于启发式路径），换成需求概括，避免全文入库。
+            raw_texts = [str(m.get("title_or_summary") or "").strip()
+                         for m in mats
+                         if (m.get("platform") == "x"
+                             or m.get("source_type") == "x_posts")
+                         and len(str(m.get("title_or_summary") or "").strip()) >= 20]
+            title = str(c.get("拟定标题") or "")
+            if any(raw and (raw in title or title in raw) for raw in raw_texts):
+                tags: list[str] = []
+                for m in mats:
+                    for tag in m.get("demand_tags") or []:
+                        if tag not in tags:
+                            tags.append(tag)
+                c["拟定标题"] = ("X 用户需求：" + "、".join(tags[:2])
+                                 if tags else "X 热点观察（标题已概括）")
+            # 其他字段若照搬帖子正文，同样替换为概括（评论证据短摘录不受影响）。
+            for key in ("核心价值", "痛点或机会", "切入角度", "推荐理由"):
+                value = str(c.get(key) or "")
+                if any(raw and (raw in value or (len(value) >= 20 and value in raw))
+                       for raw in raw_texts):
+                    c[key] = "基于 X 用户需求的概括（帖子正文未入库）"
+        c["_source_urls"] = source_urls
+        c["_v3"] = v3
+        final.append(c)
+    return merge_dual_tracks(final, top_n=max_cards)
+
+
+def cmd_topics_round(args, *, client=None, chat=None, profile=None,
+                     now: datetime | None = None) -> int:
+    """选题轮：采集→需求分类→偏好注入→LLM/启发式出卡→v3 校验→写 03/02→停 GATE-1。"""
+    from src.analysis import demand as demand_engine
+    from src.analysis import llm_topics, preference
+    from src.analysis.topics import build_topic_cards
+    from src.connectors.x_posts_source import load_x_posts
+
+    now = now or datetime.now(timezone.utc)
+    round_id = str(getattr(args, "round_id", None) or now.strftime("%Y%m%d%H%M%S"))
+    dry = bool(getattr(args, "dry_run", False))
+    state = _DryState(args.state) if dry else WorkflowState(args.state)
+    if not dry:
+        state.load()
+    if profile is None and getattr(args, "audience", None):
+        profile = load_profile(args.audience)
+    if chat is None and not dry and getattr(args, "analyze", "llm") == "llm":
+        try:
+            from src.llm.provider_chain import ProviderChain
+            chat = ProviderChain()
+        except Exception as exc:  # noqa: BLE001 - 未配置时回退启发式
+            print(f"⚠️ LLM 未配置，回退启发式：{type(exc).__name__}: {exc}")
+    if profile is None and chat is not None:
+        profile = load_profile()
+
+    # 1) 偏好：先读 05，供需求分类/打分/出卡注入；全文落本地 state 目录。
+    prefs = {"approved": [], "rejected": [], "rules": [], "candidate_rules": []}
+    if client is not None:
+        db_ids = state.get("db_ids") or ensure_kb(client, args.page_id)
+        ensure_kb_upgrades(client, db_ids)
+        state.update(db_ids=db_ids, page_root=args.page_id)
+        prefs = preference.load_recent_preferences(client, db_ids)
+    preference_text = (preference.build_preference_prompt(prefs)
+                       if any(prefs.get(k) for k in
+                              ("approved", "rejected", "rules", "candidate_rules"))
+                       else "")
+    active_rules = [str(r.get("内容") or r.get("原始选题") or "").strip()
+                    for r in (prefs.get("rules") or [])
+                    if str(r.get("内容") or r.get("原始选题") or "").strip()]
+    injection_path = _write_preference_injection(
+        Path(args.state).parent, preference_text, now)
+    if preference_text:
+        print("[偏好] 注入前 800 字：")
+        print(preference_text[:800])
+    else:
+        print("[偏好] 本轮无历史偏好注入")
+    print(f"[偏好] 全文已保存：{injection_path}")
+
+    # 2) 采集 + 校验/过滤（x-replies-file 用现有 x_posts_source 加载）
+    x_replies = getattr(args, "x_replies_file", None)
+    x_loader = ((lambda p: load_x_posts(p, replies_path=x_replies))
+                if x_replies else load_x_posts)
+    out = pipeline.step_collect(
+        state, aihot_file=getattr(args, "aihot_file", None),
+        x_following_file=getattr(args, "x_following", None),
+        x_posts_file=getattr(args, "x_file", None),
+        live=getattr(args, "live", False),
+        snapshot_dir=None if dry else "data/raw",
+        sources=getattr(args, "sources", "aihot,github,official,x"),
+        github_top=getattr(args, "github_top", 5),
+        official_limit=getattr(args, "official_limit", 3),
+        aihot_limit=getattr(args, "aihot_limit", 20),
+        import_file=getattr(args, "import_file", None),
+        config_path=getattr(args, "config", None),
+        x_posts_loader=x_loader)
+    materials = pipeline.eligible_materials(out["materials"])
+
+    # 3) 需求分类（LLM 失败回退关键词）
+    flat = _flatten_demand_comments(materials)
+    classified = demand_engine.classify_demands(
+        flat, chat=chat, preference_text=preference_text)
+    _attach_demand_results(materials, classified)
+    aggregates = demand_engine.aggregate_demands(classified)
+
+    # 4) shortlist + 打分/出卡（需求池与机会池分别生成）
+    max_cards = max(1, min(10, int(getattr(args, "max_cards", 10))))
+    short = llm_topics.shortlist(
+        materials, k=int(getattr(args, "shortlist", 60)), profile=profile)
+    seen = {m["item_id"] for m in short}
+    for m in materials:
+        if m["item_id"] not in seen and demand_engine.has_demand_evidence(m):
+            short.append(m)
+            seen.add(m["item_id"])
+
+    cards: list[dict] = []
+    if chat is not None:
+        try:
+            glm_scores = llm_topics.glm_score_posts(
+                chat, short, profile, preference_text=preference_text)
+        except Exception as exc:  # noqa: BLE001 - 打分失败仍可尝试出卡/启发式
+            print(f"⚠️ LLM 打分失败，继续尝试出卡：{type(exc).__name__}: {exc}")
+            glm_scores = {}
+        demand_pool = [m for m in short
+                       if demand_engine.has_demand_evidence(m)]
+        opp_pool = [m for m in short
+                    if not demand_engine.has_demand_evidence(m)]
+        demand_pool.sort(
+            key=lambda m: -score_item_v3(
+                m, now=now, profile=profile,
+                active_rules=active_rules)["ranking_track_score"])
+        opp_pool.sort(
+            key=lambda m: -score_item_v3(
+                m, now=now, profile=profile,
+                active_rules=active_rules)["ranking_track_score"])
+        for pool, ctype in ((demand_pool, "需求型"), (opp_pool, "机会型")):
+            if not pool:
+                continue
+            try:
+                cs, _meta = llm_topics.glm_build_cards(
+                    chat, pool, profile, now=now, glm_scores=glm_scores,
+                    min_cards=1, max_cards=max_cards,
+                    preference_text=preference_text, card_type=ctype)
+            except Exception as exc:  # noqa: BLE001 - 单轨失败不拖垮另一轨
+                print(f"⚠️ {ctype} LLM 出卡失败，稍后用启发式补："
+                      f"{type(exc).__name__}: {exc}")
+                continue
+            for c in cs:
+                c["_intended_type"] = ctype
+            cards.extend(cs)
+    if not cards:
+        heuristic, _details = build_topic_cards(
+            short, top_k=max_cards, now=now, profile=profile)
+        cards.extend(heuristic)
+
+    merged = _postprocess_round_cards(
+        cards, materials, now=now, profile=profile, max_cards=max_cards,
+        active_rules=active_rules)
+    if not merged:
+        heuristic, _details = build_topic_cards(
+            short, top_k=max_cards, now=now, profile=profile)
+        merged = _postprocess_round_cards(
+            heuristic, materials, now=now, profile=profile,
+            max_cards=max_cards, active_rules=active_rules)
+    else:
+        # 双轨交替之外再兜底：若某类素材存在但 LLM 没出该类卡，用启发式补一张。
+        present = {c.get("选题类型") for c in merged}
+        if len(present) == 1:
+            missing = "机会型" if "需求型" in present else "需求型"
+            pool = [m for m in short
+                    if (demand_engine.has_demand_evidence(m)
+                        if missing == "需求型"
+                        else not demand_engine.has_demand_evidence(m))]
+            if pool:
+                extra_cards, _details = build_topic_cards(
+                    pool, top_k=max_cards, now=now, profile=profile)
+                extra = _postprocess_round_cards(
+                    extra_cards, materials, now=now, profile=profile,
+                    max_cards=max_cards, active_rules=active_rules)
+                merged = merge_dual_tracks(merged + extra, top_n=max_cards)
+    for i, c in enumerate(merged, start=1):
+        c["topic_id"] = f"TX-{now.strftime('%Y%m%d')}-V{i:02d}"
+        c["用户选择结果"] = "待用户选择"
+
+    print(f"[topics-round] 采集 {len(materials)} 条（去重丢弃 "
+          f"{len(out.get('dropped') or [])}）；评论 {len(flat)} 条；需求类 "
+          f"{len(aggregates)} 类；合并选题卡 {len(merged)} 张")
+    for c in merged:
+        print(f"  - {c['topic_id']} [{c.get('选题类型')}/{c.get('推荐级别')}] "
+              f"{c.get('拟定标题')}")
+
+    # 5) 写 Notion（03 create_row_if_absent + 02 只增）→ 停 GATE-1
+    if getattr(args, "write_notion", False) and not dry:
+        client = client or NotionClient()
+        db_ids = state.get("db_ids") or ensure_kb(client, args.page_id)
+        ensure_kb_upgrades(client, db_ids)
+        w = pipeline.step_write_topics(
+            client, db_ids, merged, materials, only_referenced=True,
+            create_only=True)
+        d = pipeline.step_write_demands(
+            client, db_ids, aggregates, round_id=round_id)
+        cards_path = Path(args.state).parent / "cards.json"
+        cards_path.parent.mkdir(parents=True, exist_ok=True)
+        cards_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+        state.update(db_ids=db_ids, cards_path=str(cards_path), round_id=round_id,
+                     gate1={"status": "waiting", "selected": []},
+                     last_analyze={"engine": "v3-dual",
+                                   "demand_categories": len(aggregates),
+                                   "cards": len(merged)})
+        try:
+            state.set_stage("waiting_gate1")
+        except ValueError:
+            state.update(stage="waiting_gate1")
+        state.save()
+        audit_event(client, db_ids, f"topics-round-{iso_now()}", "工作流",
+                    "topics-round", True,
+                    f"需求 {len(aggregates)} 类；选题 {w['topics_written']} 张；"
+                    f"02 新增 {d['written']} 行；已停 GATE-1")
+        print(f"[写入] 03 选题 {w['topics_written']} 张；02 需求 "
+              f"{d['rows']} 类（新增 {d['written']} 行，已存在不覆盖）")
+    elif dry:
+        print("[dry-run] 未写 Notion；以上为本地预览。")
+
+    if not dry:
+        state.update(round_id=round_id)
+        try:
+            state.set_stage("waiting_gate1")
+        except ValueError:
+            state.update(stage="waiting_gate1")
+        state.save()
+
+    _log_topics_round_cost(args, chat, out, demand_count=len(classified),
+                           card_count=len(merged))
+    print("⏸ GATE-1（第一人工关口）：请在 Notion「03_选题决策」人工选定 1–3 张，"
+          "然后运行 feedback / draft。当前停在 GATE-1，未进入文案。")
+    return 0
+
+
 # ---------------------------------------------------------------------- dry-state
 class _DryState:
     """dry-run 用的哑状态（不落盘）。"""
@@ -643,6 +1155,51 @@ def main() -> int:
     p.add_argument("--notion-sources", default="aihot,github,official",
                    help="--write-notion 允许写入的来源（默认不含 X 与 import）")
 
+    # ---------------------------------------------------------- 阶段3 子命令
+    p = sub.add_parser("feedback", parents=[common],
+                       help="记录 GATE-1 反馈到 05（不改 03）")
+    p.add_argument("--topic", required=True, help="topic_id（如 TX-20261102-V01）")
+    p.add_argument("--pick", required=True, choices=["认可", "一般", "否决"])
+    p.add_argument("--say", required=True, help="用户原话反馈")
+    p.add_argument("--reason", default="", help="原因标签")
+    p.add_argument("--round", type=int, default=None, help="反馈轮次")
+    p.add_argument("--title", default="", help="原始选题")
+    p.add_argument("--why", default="", help="推荐理由")
+    p.add_argument("--next", default="", help="下轮参考")
+
+    p = sub.add_parser("feedback-seed", parents=[common],
+                       help="从本地 JSON 批量写反馈（文件放 data/state，不入库）")
+    p.add_argument("--file", required=True, help="反馈 JSON（数组或 {items:[...]}）")
+
+    p = sub.add_parser("rules", parents=[common],
+                       help="候选规则：--propose 生成待确认规则；--confirm 只提示手动改状态")
+    p.add_argument("--propose", action="store_true")
+    p.add_argument("--confirm", default=None, help="候选规则 record_id（只提示，不改状态）")
+    p.add_argument("--llm", default="template", choices=["template", "llm"])
+
+    p = sub.add_parser("topics-round", parents=[common],
+                       help="选题轮：采集→需求分类→偏好注入→出卡→写03/02→停GATE-1")
+    p.add_argument("--sources", default="aihot,github,official,x")
+    p.add_argument("--x-file", dest="x_file", default=None)
+    p.add_argument("--x-replies-file", dest="x_replies_file", default=None,
+                   help="X API 原样回复文件（data/includes/replies/meta）")
+    p.add_argument("--x-following", dest="x_following", default=None)
+    p.add_argument("--aihot-file", dest="aihot_file",
+                   default="data/examples/aihot_fake_sample.json")
+    p.add_argument("--import-file", default=None)
+    p.add_argument("--github-top", type=int, default=5)
+    p.add_argument("--aihot-limit", type=int, default=20)
+    p.add_argument("--official-limit", type=int, default=3)
+    p.add_argument("--max-cards", type=int, default=10)
+    p.add_argument("--round-id", default=None)
+    p.add_argument("--write-notion", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--config", default="config/sources.example.yaml")
+    p.add_argument("--audience", default="config/audience_profile.yaml")
+    p.add_argument("--shortlist", type=int, default=60)
+    p.add_argument("--analyze", default="llm", choices=["heuristic", "llm"])
+
     args = ap.parse_args()
     if args.cmd == "collect":
         return cmd_collect(args)
@@ -663,6 +1220,14 @@ def main() -> int:
         return cmd_github(args)
     if args.cmd == "sources-check":
         return cmd_sources_check(args)
+    if args.cmd == "feedback":
+        return cmd_feedback(args)
+    if args.cmd == "feedback-seed":
+        return cmd_feedback_seed(args)
+    if args.cmd == "rules":
+        return cmd_rules(args)
+    if args.cmd == "topics-round":
+        return cmd_topics_round(args)
     return 1
 
 

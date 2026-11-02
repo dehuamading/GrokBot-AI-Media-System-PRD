@@ -270,15 +270,22 @@ def step_write_raw_materials_if_absent(client, db_ids, materials: list[dict], *,
             "skipped_existing_items": skipped}
 
 
+def _pending(value) -> str:
+    text = str(value or "").strip()
+    return text if text and text not in ("未知", "待核实", "待确认") else "待验证"
+
+
 def step_write_topics(client, db_ids, cards: list[dict],
                       materials: list[dict], page_ids: dict[str, str] | None = None,
-                      only_referenced: bool = True) -> dict:
+                      only_referenced: bool = True,
+                      create_only: bool = False) -> dict:
     """S3 写入 Notion：01 更新分数/状态；03 upsert 选题卡（待用户选择）。
 
     only_referenced=True（任务05）：01 只写被选题卡引用到的素材，
     避免把上千条原始帖子写进 Notion。
     """
-    from src.notion_store.client import number_prop, rt, select_prop
+    from src.notion_store.client import (number_prop, rt, select_prop,
+                                         url_prop)
     page_ids = page_ids or {}
     if only_referenced:
         used_ids = {iid for c in cards for iid in c["关联素材"]}
@@ -289,10 +296,17 @@ def step_write_topics(client, db_ids, cards: list[dict],
                           _material_notion_properties(it))
         n_mat += 1
 
+    db_id = db_ids["03_选题决策"]
+    schema = set((client.get_database(db_id).get("properties") or {}).keys())
     n_top = 0
     for c in cards:
+        # 原始来源必须是素材 source_url；缺失则不出卡（不编造来源）。
+        source_url = (c.get("原始来源")
+                      or ((c.get("_source_urls") or [None])[0]))
+        if not source_url:
+            continue
         linked = "、".join(f"{iid}" for iid in c["关联素材"])
-        client.upsert_row(db_ids["03_选题决策"], "topic_id", c["topic_id"], {
+        props = {
             "拟定标题": rt(c["拟定标题"]), "建议平台": select_prop(c["建议平台"]),
             "面向谁": rt(c["面向谁"]), "核心价值": rt(c["核心价值"]),
             "为什么现在": rt(c["为什么现在"]), "关联素材": rt(linked),
@@ -306,10 +320,68 @@ def step_write_topics(client, db_ids, cards: list[dict],
             "国内可用性": rt(c.get("国内可用性")),
             "引用帖子": rt(c.get("引用帖子")),
             "综合评分": number_prop(c.get("综合评分")),
-        })
+            # 阶段3 新字段（列不存在时跳过该属性）
+            "选题类型": rt(_pending(c.get("选题类型") or c.get("类型"))),
+            "面向用户": rt(_pending(c.get("面向用户"))),
+            "痛点或机会": rt(_pending(c.get("痛点或机会"))),
+            "原始来源": url_prop(source_url),
+            "为何现在做": rt(_pending(c.get("为何现在做"))),
+            "国内可用": rt(_pending(c.get("国内可用"))),
+            "是否付费": rt(_pending(c.get("是否付费"))),
+            "能否实际验证": rt(_pending(c.get("能否实际验证"))),
+            "切入角度": rt(_pending(c.get("切入角度"))),
+            "主要风险": rt(_pending(c.get("主要风险"))),
+            "评分版本": rt(_pending(c.get("评分版本"))),
+            "轨道得分": number_prop(c.get("轨道得分")),
+            "副业证据等级": rt(_pending(c.get("副业证据等级"))),
+            "传播潜力假设(不计分)": rt(_pending(
+                c.get("传播潜力假设(不计分)") or c.get("传播潜力假设"))),
+        }
+        props = {k: v for k, v in props.items() if k in schema}
+        writer = client.create_row_if_absent if create_only else client.upsert_row
+        writer(db_id, "topic_id", c["topic_id"], props)
         n_top += 1
     return {"materials_written": n_mat, "topics_written": n_top,
             "materials_total": len(materials)}
+
+
+def step_write_demands(client, db_ids, aggregates, *,
+                       round_id: str | None = None,
+                       max_evidence: int = 3) -> dict:
+    """把需求聚合只增写入 02_用户需求（每类一行，计数=真实评论条数）。"""
+    from src.notion_store.client import rt, select_prop, url_prop
+    db_id = db_ids.get("02_用户需求")
+    if not db_id:
+        return {"rows": 0, "written": 0, "categories": []}
+    schema = set((client.get_database(db_id).get("properties") or {}).keys())
+    stamp = round_id or iso_now().replace(":", "").replace("+", "_")
+    written: list[dict] = []
+    for rec in aggregates:
+        category = rec.get("category")
+        count = int(rec.get("count") or 0)
+        if not category or count <= 0:
+            continue
+        evidence = list(rec.get("evidence_short") or rec.get("evidence") or [])
+        evidence = evidence[:max(0, max_evidence)]
+        short = "；".join(f"「{e.get('text', '')}」" for e in evidence) or "（无）"
+        problem_id = f"DEMAND-{stamp}-{category}"
+        props = {
+            "user_type": select_prop("其他"),
+            "problem": rt(f"{category}｜实际评论 {count} 条（仅真实评论计数，不估算）"),
+            "evidence_url": url_prop(rec.get("source_urls", [None])[0]
+                                     if rec.get("source_urls") else None),
+            "sample_limit": rt(f"计数={count}；脱敏短证据（≤{max_evidence}条）：{short}"),
+            "status": select_prop("待验证"),
+        }
+        props = {k: v for k, v in props.items() if k in schema}
+        _, created = client.create_row_if_absent(
+            db_id, "problem_id", problem_id, props)
+        written.append({"problem_id": problem_id, "category": category,
+                        "count": count, "created": created})
+    return {"rows": len(written),
+            "written": sum(1 for w in written if w["created"]),
+            "categories": [w["category"] for w in written],
+            "items": written}
 
 
 # ---------------------------------------------------------------------- S4

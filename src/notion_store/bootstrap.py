@@ -24,7 +24,7 @@ def _sel(*options: str):
 
 
 def _status_sel():
-    return _sel("待验证", "已验证", "正在使用", "需要复核", "已过时")
+    return _sel("待验证", "已验证", "正在使用", "需要复核", "已过时", "待确认")
 
 
 DATABASE_SPECS: dict[str, tuple[str, dict]] = {
@@ -88,6 +88,21 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
         "国内可用性": _rt(),
         "引用帖子": _rt(),
         "综合评分": _num(),
+        # 阶段3 选题卡新字段（只增；与旧列同名的不重复建）
+        "选题类型": _rt(),
+        "面向用户": _rt(),
+        "痛点或机会": _rt(),
+        "原始来源": _url(),
+        "为何现在做": _rt(),
+        "国内可用": _rt(),
+        "是否付费": _rt(),
+        "能否实际验证": _rt(),
+        "切入角度": _rt(),
+        "主要风险": _rt(),
+        "评分版本": _rt(),
+        "轨道得分": _num(),
+        "副业证据等级": _rt(),
+        "传播潜力假设(不计分)": _rt(),
     }),
     "04_文案与版本": ("✍️", {
         "draft_id": _title(),
@@ -102,7 +117,7 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
     }),
     "05_经验与复盘": ("🧠", {
         "record_id": _title(),
-        "类型": _sel("规则", "经验", "复盘"),
+        "类型": _sel("规则", "经验", "复盘", "认可素材", "反馈", "候选规则"),
         "适用范围": _rt(),
         "内容": _rt(),
         "依据": _rt(),
@@ -110,6 +125,16 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
         "性质": _sel("原始事实", "当事人自述", "用户偏好", "AI推断假设", "已验证经验"),
         "version": _num(),
         "updated_at": _date(),
+        # 阶段3 偏好闭环字段（只增；与旧列同名的不重复建）
+        "topic_id": _rt(),
+        "原始选题": _rt(),
+        "推荐理由": _rt(),
+        "用户选择": _sel("认可", "一般", "否决"),
+        "原话反馈": _rt(),
+        "原因标签": _rt(),
+        "轮次": _num(),
+        "反馈时间": _date(),
+        "下轮参考": _rt(),
     }),
     "08_维护与审计": ("🧾", {
         "event_id": _title(),
@@ -153,15 +178,46 @@ DB_UPGRADES: dict[str, dict] = {
         "国内可用性": {"rich_text": {}},
         "引用帖子": {"rich_text": {}},
         "综合评分": {"number": {"format": "number"}},
+        # 阶段3 选题卡新字段（只增；名称与旧列同名时自动跳过）
+        "选题类型": {"rich_text": {}},
+        "面向用户": {"rich_text": {}},
+        "痛点或机会": {"rich_text": {}},
+        "原始来源": {"url": {}},
+        "为何现在做": {"rich_text": {}},
+        "国内可用": {"rich_text": {}},
+        "是否付费": {"rich_text": {}},
+        "能否实际验证": {"rich_text": {}},
+        "切入角度": {"rich_text": {}},
+        "主要风险": {"rich_text": {}},
+        "评分版本": {"rich_text": {}},
+        "轨道得分": {"number": {"format": "number"}},
+        "副业证据等级": {"rich_text": {}},
+        "传播潜力假设(不计分)": {"rich_text": {}},
     },
     "04_文案与版本": {
         "生成引擎": {"rich_text": {}},
+    },
+    "05_经验与复盘": {
+        "topic_id": {"rich_text": {}},
+        "原始选题": {"rich_text": {}},
+        "推荐理由": {"rich_text": {}},
+        "用户选择": {"select": {"options": [{"name": o} for o in
+                                          ("认可", "一般", "否决")]}},
+        "原话反馈": {"rich_text": {}},
+        "原因标签": {"rich_text": {}},
+        "轮次": {"number": {"format": "number"}},
+        "反馈时间": {"date": {}},
+        "下轮参考": {"rich_text": {}},
     },
 }
 
 # 只增下拉选项升级（不删除既有选项，不改动已有行数据）
 DB_SELECT_OPTION_UPGRADES: dict[str, dict[str, list[str]]] = {
     "01_原始素材": {"source_type": ["x_posts", "github", "official", "import"]},
+    "05_经验与复盘": {
+        "类型": ["认可素材", "反馈", "候选规则"],
+        "状态": ["待确认"],
+    },
 }
 
 
@@ -171,7 +227,10 @@ def ensure_kb_upgrades(client: NotionClient, db_ids: dict[str, str]) -> dict[str
     for name, props in DB_UPGRADES.items():
         db_id = db_ids.get(name)
         if db_id:
-            added[name] = client.add_database_columns(db_id, props)
+            new_cols = client.add_database_columns(db_id, props)
+            # 兼容旧调用方/测试的返回形状：03/04 始终出现；其余库仅在真有新增时报告。
+            if new_cols or name in ("03_选题决策", "04_文案与版本"):
+                added[name] = new_cols
     for name, prop_options in DB_SELECT_OPTION_UPGRADES.items():
         db_id = db_ids.get(name)
         if not db_id:

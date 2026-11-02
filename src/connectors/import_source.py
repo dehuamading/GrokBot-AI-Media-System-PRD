@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from src.analysis.demand import (DEMAND_CATEGORIES,  # noqa: F401 - 旧接口兼容
+                                 classify_comment_demand)
 from src.normalize import iso_now, make_item_id, normalize_url
 
 PLATFORMS = {"douyin", "bilibili", "xiaohongshu", "other"}
@@ -23,38 +25,8 @@ REQUIRED_FIELDS = ["platform", "original_url", "title", "published_at",
                    "authorization_status"]
 DEFAULT_ERRORS_PATH = "data/state/import_errors.jsonl"
 
-# 评论需求分类 stub（第3阶段将替换为 analysis/demand.py 的正式实现）
-DEMAND_CATEGORIES: list[tuple[str, list[str]]] = [
-    ("安装部署", ["安装", "部署", "配置", "环境", "docker", "pip install",
-                  "npm install", "怎么装", "装上"]),
-    ("注册付款", ["注册", "登录", "付款", "支付", "订阅", "充值", "账号",
-                  "信用卡", "外币卡", "扣费", "收费"]),
-    ("国内使用", ["国内", "中国", "能用吗", "访问", "网络", "梯子", "翻墙",
-                  "魔法", "被墙"]),
-    ("免费替代", ["免费", "白嫖", "替代", "平替", "开源", "破解", "试用",
-                  "不要钱"]),
-    ("AI编程", ["编程", "代码", "cursor", "claude code", "vibe coding",
-                "开发", "小程序", "网站", "api", "写代码"]),
-    ("AI内容创作", ["短视频", "视频", "剪辑", "配音", "数字人", "写作",
-                    "图片", "绘画", "文案", "自媒体", "起号"]),
-    ("AI副业赚钱", ["副业", "赚钱", "变现", "接单", "创业", "月入", "收入",
-                    "怎么卖"]),
-    ("工作效率", ["办公", "excel", "ppt", "表格", "文档", "效率", "自动化",
-                  "工作流"]),
-    ("工具比较", ["对比", "比较", "哪个好", "哪个更", "vs", "区别", "选择"]),
-    ("故障排查", ["报错", "失败", "崩溃", "卡住", "不工作", "无法", "bug",
-                  "解决", "闪退"]),
-]
-
-
-def classify_comment_demand(text: str) -> list[str]:
-    """评论需求分类钩子（关键词 stub，透明可解释；第3阶段替换）。"""
-    lowered = (text or "").lower()
-    tags: list[str] = []
-    for category, keywords in DEMAND_CATEGORIES:
-        if any(k.lower() in lowered for k in keywords):
-            tags.append(category)
-    return tags
+# 评论需求分类已统一到 analysis/demand.py（同一套 10 类标签 + 「其他」）。
+# 这里保留 import_source.classify_comment_demand 的旧导入路径，避免破坏既有调用方。
 
 
 class FeishuAdapter:
