@@ -8,7 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-ALLOWED_HOSTS = {"aihot.news", "api.notion.com"}  # src 中唯一允许的硬编码 API 主机
+ALLOWED_HOSTS = {"aihot.news", "api.notion.com",
+                 "api.github.com"}  # 只增：阶段2-B GitHub 官方 REST；X 主机禁令保持
 
 
 def test_no_hardcoded_hosts_beyond_allowlist():

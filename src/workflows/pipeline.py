@@ -14,32 +14,127 @@ from src.analysis.classify import classify_item
 from src.analysis.scoring import SCORING_VERSION
 from src.analysis.topics import build_topic_cards
 from src.connectors.aihot_source import fetch_selected, load_from_file
+from src.connectors.github_source import DEFAULT_SNAPSHOTS, fetch_github
+from src.connectors.github_source import load_config as load_github_config
+from src.connectors.import_source import load_import_file
+from src.connectors.official_source import fetch_official
 from src.connectors.x_following_source import load_following
 from src.connectors.x_posts_source import load_x_posts
 from src.llm.base import DraftClient, platforms_of
-from src.normalize import dedupe, iso_now, screen_score, validate_item
+from src.normalize import iso_now, screen_score, validate_item
 from src.notion_store.gates import (read_gate1_selections, read_gate2_status,
                                     validate_gate1, write_draft_row)
+from src.validate import dedupe as validate_dedupe
+from src.validate import validate_item as validate_source_item
+
+DEFAULT_SOURCES = ["aihot", "x"]
+KNOWN_SOURCES = {"aihot", "github", "official", "x", "import"}
 
 
 # ---------------------------------------------------------------------- S1
+def _selected_sources(sources) -> list[str]:
+    if sources is None:
+        return list(DEFAULT_SOURCES)
+    if isinstance(sources, str):
+        sources = [s.strip() for s in sources.split(",") if s.strip()]
+    selected = []
+    for name in sources:
+        name = str(name).strip().lower()
+        if name and name not in selected:
+            selected.append(name)
+    unknown = set(selected) - KNOWN_SOURCES
+    if unknown:
+        raise ValueError(f"未知来源：{sorted(unknown)}（允许 {sorted(KNOWN_SOURCES)}）")
+    return selected
+
+
 def step_collect(state, *, aihot_file: str | Path | None = None,
                  x_following_file: str | Path | None = None,
                  x_posts_file: str | Path | None = None,
                  live: bool = False, snapshot_dir: str | Path = "data/raw",
+                 sources=None, github_top: int = 5, official_limit: int = 3,
+                 aihot_limit: int = 20,
+                 import_file: str | Path | None = None,
+                 config_path: str | Path | None = None,
+                 github_snapshots_path: str | Path = DEFAULT_SNAPSHOTS,
+                 import_errors_path: str | Path = "data/state/import_errors.jsonl",
                  fetcher=fetch_selected, loader=load_from_file,
-                 x_posts_loader=load_x_posts, following_loader=load_following) -> dict:
-    """S1 数据抓取：aihot（默认离线回放；--live 才真实请求，≤20 条）
-    + X 名单文件（账号注册表）+ X 帖子文件（任务05，纯本地 JSON，不访问 X）。"""
-    materials = fetcher(limit=20) if live else (loader(aihot_file) if aihot_file else [])
-    x_posts = x_posts_loader(x_posts_file) if x_posts_file else []
-    materials = materials + x_posts
-    accounts = following_loader(x_following_file) if x_following_file else []
+                 x_posts_loader=load_x_posts, following_loader=load_following,
+                 github_fetcher=fetch_github,
+                 official_fetcher=fetch_official,
+                 import_loader=load_import_file) -> dict:
+    """S1 数据抓取（默认来源保持 aihot+x，行为不变）。
+
+    --sources 可增选 github/official/import；所有采集仍由手动命令触发。
+    """
+    selected = _selected_sources(sources)
+    materials: list[dict] = []
+    per_source: dict[str, int] = {name: 0 for name in selected}
+    source_errors: dict[str, list] = {}
+    external = {"github": 0, "aihot": 0, "official": 0, "x": 0, "import": 0}
+    x_posts: list[dict] = []
+    accounts: list[dict] = []
+
+    if "aihot" in selected:
+        aihot_items = (fetcher(limit=aihot_limit) if live
+                       else (loader(aihot_file) if aihot_file else []))
+        materials.extend(aihot_items)
+        per_source["aihot"] = len(aihot_items)
+        external["aihot"] = 1 if live else 0
+
+    if "x" in selected:
+        x_posts = x_posts_loader(x_posts_file) if x_posts_file else []
+        materials.extend(x_posts)
+        per_source["x"] = len(x_posts)
+        accounts = following_loader(x_following_file) if x_following_file else []
+
+    if "github" in selected:
+        gh_config = load_github_config(config_path)
+        try:
+            gh = github_fetcher(top=github_top, themes=gh_config["themes"],
+                                since_days=gh_config["since_days"],
+                                snapshots_path=github_snapshots_path)
+        except Exception as exc:  # noqa: BLE001 - 单源失败不拖垮其他来源
+            gh = {"items": [], "api_calls": 0, "errors": [
+                f"GitHub 连接器异常：{type(exc).__name__}: {exc}"]}
+        materials.extend(gh.get("items") or [])
+        per_source["github"] = len(gh.get("items") or [])
+        external["github"] = gh.get("api_calls", 0)
+        if gh.get("errors"):
+            source_errors["github"] = list(gh["errors"])
+
+    if "official" in selected:
+        try:
+            off = official_fetcher(config_path=config_path,
+                                   default_limit=official_limit)
+        except Exception as exc:  # noqa: BLE001
+            off = {"items": [], "api_calls": 0, "errors": [
+                {"source": "官方源", "error": f"{type(exc).__name__}: {exc}"}]}
+        materials.extend(off.get("items") or [])
+        per_source["official"] = len(off.get("items") or [])
+        external["official"] = off.get("api_calls", 0)
+        if off.get("errors"):
+            source_errors["official"] = list(off["errors"])
+
+    if "import" in selected and import_file:
+        imported = import_loader(import_file, errors_path=import_errors_path)
+        materials.extend(imported.get("items") or [])
+        per_source["import"] = len(imported.get("items") or [])
+        if imported.get("errors"):
+            source_errors["import"] = list(imported["errors"])
+
+    validation_error_counts: dict[str, int] = {}
     for it in materials:
-        errs = validate_item(it)
+        if it.get("source_type") in {"aihot", "x_posts"}:
+            errs = validate_item(it)
+            if errs:
+                raise ValueError(f"素材校验失败 {it['item_id']}: {errs}")
+        errs = validate_source_item(it)
         if errs:
-            raise ValueError(f"素材校验失败 {it['item_id']}: {errs}")
-    materials, dropped = dedupe(materials)
+            stype = str(it.get("source_type") or "unknown")
+            validation_error_counts[stype] = validation_error_counts.get(stype, 0) + 1
+
+    materials, dropped = validate_dedupe(materials)
 
     snapshot = None
     if snapshot_dir:
@@ -51,12 +146,15 @@ def step_collect(state, *, aihot_file: str | Path | None = None,
 
     state.update(last_collect={"materials": len(materials), "dropped": len(dropped),
                                "accounts": len(accounts), "live": live,
-                               "x_posts": len(x_posts),
+                               "x_posts": len(x_posts), "per_source": per_source,
                                "snapshot": snapshot, "run_id": iso_now()})
     state.set_stage("collected")
     state.save()
     return {"materials": materials, "accounts": accounts, "dropped": dropped,
-            "snapshot": snapshot, "x_posts": len(x_posts)}
+            "snapshot": snapshot, "x_posts": len(x_posts),
+            "per_source": per_source, "validation_error_counts": validation_error_counts,
+            "source_errors": source_errors, "external_calls": external,
+            "sources": selected}
 
 
 # ---------------------------------------------------------------------- S2

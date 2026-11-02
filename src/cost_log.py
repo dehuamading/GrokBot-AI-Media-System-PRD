@@ -44,6 +44,7 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
     tokens = _pick(data, "tokens", default=UNKNOWN)
     cost = _normalize_cost(_pick(data, "cost", "金额", "amount"))
     external = _pick(data, "external_api_calls", "外部API调用", "external", default={})
+    note = _pick(data, "note", "备注", default="")
 
     out = {
         # 规范字段（英文，便于程序消费）
@@ -57,12 +58,14 @@ def append_cost(path: str | Path = DEFAULT_COST_LOG,
         "tokens": tokens,
         "cost": cost,
         "external_api_calls": external,
+        "note": note,
         # 中文列名（与任务书字段一一对应）
         "时间": timestamp,
         "命令": command,
         "调用次数": calls,
         "金额": cost,
         "外部API调用": external,
+        "备注": note,
     }
 
     p = Path(path)

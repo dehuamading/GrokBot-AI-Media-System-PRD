@@ -35,3 +35,73 @@ weights:                   # 优先级（PRD 3.6）：可调参数
 limits:
   notion_throttle_seconds: 0.35   # ≈2.9 req/s < Notion 3 req/s
   retry_max: 4
+
+# ===== 阶段2-B：GitHub 连接器（官方 REST，topic 查询可改） =====
+github:
+  enabled: true
+  top: 5                    # 默认取前 5 个，可用 --github-top 覆盖
+  since_days: 30            # pushed:>近30天
+  themes:
+    - id: mcp
+      label: MCP
+      query: "topic:mcp"
+    - id: ai_agent
+      label: AI agent
+      query: "topic:ai-agents"
+    - id: ai_coding
+      label: AI coding tools
+      query: 'topic:ai-coding OR "AI coding" in:description'
+    - id: ai_automation
+      label: AI automation
+      query: 'topic:automation AI in:description'
+    - id: ai_video
+      label: AI video generation
+      query: 'topic:ai-video OR "video generation" in:description'
+    - id: ai_app_dev
+      label: AI app dev
+      query: 'topic:vibe-coding OR "app builder" in:description'
+    - id: side_hustle
+      label: side-hustle tools（副业工具）
+      query: 'topic:side-hustle OR "side project" in:description'
+    - id: beginner
+      label: beginner-usable open source
+      query: 'topic:no-code OR "beginner friendly" in:description'
+
+# ===== 阶段2-B：官方源（≤5，URL/仓库均放配置，不写死在代码） =====
+# 2026-11-02 curl 验证：OpenAI RSS 200、Google AI RSS 200、
+# anthropics/claude-code releases 200、openai/codex releases 200、
+# QwenLM/qwen-code releases 200（QwenLM/Qwen3 无 releases，已替换为 qwen-code）。
+official_sources:
+  - id: openai_news
+    name: OpenAI 新闻
+    type: rss
+    url: https://openai.com/news/rss.xml
+    limit: 3
+    enabled: true
+  - id: google_ai_blog
+    name: Google AI/Gemini 博客
+    type: rss
+    url: https://blog.google/technology/ai/rss/
+    limit: 3
+    enabled: true
+  - id: anthropic_claude_code
+    name: Anthropic Claude Code Releases
+    type: github_releases
+    owner: anthropics
+    repo: claude-code
+    limit: 3
+    enabled: true
+  - id: openai_codex
+    name: OpenAI Codex Releases
+    type: github_releases
+    owner: openai
+    repo: codex
+    limit: 3
+    enabled: true
+  - id: qwen_code
+    name: 通义千问 Qwen Code Releases
+    type: github_releases
+    owner: QwenLM
+    repo: qwen-code
+    limit: 3
+    enabled: true

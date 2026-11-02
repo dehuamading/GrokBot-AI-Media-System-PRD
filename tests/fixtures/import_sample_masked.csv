@@ -1,0 +1,4 @@
+platform,original_url,title,comments,published_at,collected_at,keywords,metrics,source,authorization_status
+xiaohongshu,https://example.com/note/3003/,AI 工具上手笔记（虚构样例）,怎么部署|有没有免费替代,2026-10-21T10:00:00Z,2026-11-02T09:10:00Z,AI|工具,"{""likes"": 50, ""comments"": 2}",手工导入（脱敏样例）,公开
+xiaohongshu,https://example.com/note/3003?utm_source=manual,AI 工具上手笔记（虚构样例）,会报错怎么办,2026-10-21T10:00:00Z,2026-11-02T09:11:00Z,AI|故障,"{""likes"": 50, ""comments"": 3}",手工导入（脱敏样例）,公开
+bilibili,https://example.com/video/4004,办公自动化入门（虚构样例）,和别的工具比哪个好|Excel 能直接用吗,2026-10-23T10:00:00Z,2026-11-02T09:12:00Z,办公|效率,"{""likes"": 30, ""comments"": 2}",手工导入（脱敏样例）,待确认

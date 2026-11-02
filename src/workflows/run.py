@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.analysis.audience import load_profile  # noqa: E402
 from src.analysis.scoring import SCORING_VERSION  # noqa: E402
+from src.connectors.github_source import (DEFAULT_SNAPSHOTS, fetch_github,  # noqa: E402
+                                          load_config as load_github_config)
 from src.cost_log import UNKNOWN, append_cost  # noqa: E402
 from src.llm.base import DraftClient  # noqa: E402
 from src.llm.template_client import TemplateClient  # noqa: E402
@@ -85,26 +87,31 @@ def _aggregate_usage(chat) -> dict:
 def _log_collect_cost(args, out: dict, chat, analyze_mode: str) -> dict:
     path = Path(args.state).parent / "cost_log.jsonl"
     if chat is None:
+        # 未使用 LLM：provider=无，金额 0（免费接口），不是“未知”冒充 0。
         stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                  "tokens": 0, "cost": 0}
-        provider, model = "heuristic", SCORING_VERSION
+        provider, model = "无", "无"
+        note = "免费接口（AIHot/GitHub/RSS/Releases）；未使用 LLM"
     else:
         stats = _aggregate_usage(chat)
         provider, model = _serving_label(chat, analyze_mode)
+        note = ""
     external = out.get("external_calls")
     if not isinstance(external, dict):
         external = {"github": 0, "aihot": 1 if getattr(args, "live", False) else 0,
-                    "official": 0, "x": 0}
+                    "official": 0, "x": 0, "import": 0}
     record = append_cost(path, {
-        "command": f"collect --analyze {analyze_mode}",
+        "command": f"collect --sources {getattr(args, 'sources', 'aihot,x')} "
+                   f"--analyze {analyze_mode}",
         "provider": provider,
         "model": model,
         **stats,
         "external_api_calls": external,
+        "note": note,
     })
     print(f"[成本] 实际服务 provider={record['provider']} model={record['model']}；"
           f"调用 {record['calls']} 次，tokens={record['tokens']}，"
-          f"金额={record['金额']}")
+          f"金额={record['金额']}；外部请求={external}")
     return record
 
 
@@ -138,7 +145,10 @@ def cmd_collect(args) -> int:
         state if not args.dry_run else dry,
         aihot_file=args.aihot_file, x_following_file=args.x_following,
         x_posts_file=args.x_posts,
-        live=args.live, snapshot_dir=None if args.dry_run else "data/raw")
+        live=args.live, snapshot_dir=None if args.dry_run else "data/raw",
+        sources=args.sources, github_top=args.github_top,
+        official_limit=args.official_limit, import_file=args.import_file,
+        config_path=args.config)
 
     analyze_meta = {"engine": f"heuristic:{SCORING_VERSION}"}
     analyze_mode = getattr(args, "analyze", "heuristic")
@@ -183,6 +193,12 @@ def cmd_collect(args) -> int:
     print(f"[S1] 素材 {len(out['materials'])} 条（去重丢弃 {len(out['dropped'])}，"
           f"{'真实拉取' if args.live else '离线回放'}；X 帖子文件 {out['x_posts']} 条；"
           f"X 账号 {len(out['accounts'])} 个（仅文件）")
+    print("[S1] 来源计数：" + "，".join(
+        f"{name}={count}" for name, count in out["per_source"].items()))
+    if out.get("validation_error_counts"):
+        print(f"[S1] 校验错误计数：{out['validation_error_counts']}")
+    for name, errs in (out.get("source_errors") or {}).items():
+        print(f"[S1] ⚠️ {name} 错误 {len(errs)} 条：{str(errs[0])[:180]}")
     print(f"[S2] 分析引擎：{analyze_meta['engine']}；选题卡 {len(ana['cards'])} 张"
           + (f"（{('LLM' if analyze_mode == 'llm' else 'GLM')} 调用 "
              f"{analyze_meta['glm_calls']} 次，候选 {analyze_meta['shortlist']} 条）"
@@ -351,6 +367,142 @@ def cmd_selfcheck(args) -> int:
     return 0 if ok else 1
 
 
+# ---------------------------------------------------------------------- github
+def cmd_github(args) -> int:
+    """只做 GitHub 研究：真实官方 REST → data/state JSON + 终端表格，不写 Notion。"""
+    cfg = load_github_config(args.config)
+    out = fetch_github(top=args.top, themes=cfg["themes"],
+                       since_days=cfg["since_days"],
+                       snapshots_path=args.snapshots)
+    state_dir = Path(args.state).parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    stamp = iso_now().replace(":", "").replace("+", "_")
+    path = state_dir / f"github_{stamp}.json"
+    payload = {"time": iso_now(), "command": f"github --top {args.top}",
+               **out}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+
+    print(f"[github] top={args.top} 真实请求 {out['api_calls']} 次；"
+          f"结果 {len(out['items'])} 个 → {path}")
+    print(f"{'仓库':<34}{'Stars':>8}  {'最近更新':<12}{'最新版本':<22}"
+          f"{'许可证':<12}{'安装难度':<12}适合人群 | 是否值得做视频")
+    for it in out["items"]:
+        gh = it["extra"]["github"]
+        users = "、".join(gh.get("target_users") or [])
+        print(f"{gh.get('full_name', ''):<34}{gh.get('stars', 0):>8}  "
+              f"{(gh.get('last_update') or '')[:10]:<12}"
+              f"{str(gh.get('latest_release', '无'))[:20]:<22}"
+              f"{str(gh.get('license', ''))[:10]:<12}"
+              f"{str(gh.get('install_difficulty', ''))[:10]:<12}"
+              f"{users} | {gh.get('worth_video', '')}")
+    for err in out.get("errors") or []:
+        print(f"[github] ⚠️ {err}")
+
+    record = append_cost(state_dir / "cost_log.jsonl", {
+        "command": f"github --top {args.top}",
+        "provider": "无", "model": "无",
+        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+        "tokens": 0, "cost": 0,
+        "external_api_calls": {"github": out["api_calls"], "aihot": 0,
+                               "official": 0, "x": 0, "import": 0},
+        "note": "免费接口（GitHub 官方 REST）；未使用 LLM",
+    })
+    print(f"[成本] provider={record['provider']} 金额={record['金额']}；"
+          f"GitHub 请求 {out['api_calls']} 次（免费接口）")
+    return 0
+
+
+# ----------------------------------------------------------------- sources-check
+def cmd_sources_check(args) -> int:
+    """真实小样验证：采集→归一化→校验→去重；只写 data/state 与成本日志，不写 Notion。"""
+    sources = ["aihot", "github", "official", "x", "import"]
+    if not args.x_file:
+        sources.remove("x")
+    if not args.import_file:
+        sources.remove("import")
+    state_dir = Path(args.state).parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    out = pipeline.step_collect(
+        _DryState(args.state), x_posts_file=args.x_file,
+        x_following_file=None, live=True, snapshot_dir=None,
+        sources=sources, github_top=args.github_top,
+        official_limit=args.official_limit, aihot_limit=args.aihot_limit,
+        import_file=args.import_file, config_path=args.config,
+        import_errors_path=state_dir / "import_errors.jsonl")
+
+    def source_of(item_id) -> str:
+        prefix = str(item_id or "").split(":", 1)[0]
+        return {"x_posts": "x"}.get(prefix, prefix)
+
+    deduped = {name: 0 for name in sources}
+    for report in out["dropped"]:
+        name = source_of(report.get("item_id"))
+        if name in deduped:
+            deduped[name] += 1
+    validation = {name: 0 for name in sources}
+    for stype, count in (out.get("validation_error_counts") or {}).items():
+        name = {"x_posts": "x"}.get(stype, stype)
+        if name in validation:
+            validation[name] += count
+    fetch_errors = {name: 0 for name in sources}
+    for name, errs in (out.get("source_errors") or {}).items():
+        if name in fetch_errors:
+            fetch_errors[name] += len(errs)
+    per_source = {}
+    for name in sources:
+        per_source[name] = {
+            "fetched": out["per_source"].get(name, 0),
+            "errors": validation.get(name, 0) + fetch_errors.get(name, 0),
+            "deduped": deduped.get(name, 0),
+        }
+
+    print("[sources-check] 真实小样：归一化/校验/去重（默认不写 Notion）")
+    print(f"{'来源':<12}{'条数':>6}{'错误':>6}{'去重':>6}")
+    for name in sources:
+        row = per_source[name]
+        print(f"{name:<12}{row['fetched']:>6}{row['errors']:>6}{row['deduped']:>6}")
+    total_fetched = sum(r["fetched"] for r in per_source.values())
+    total_errors = sum(r["errors"] for r in per_source.values())
+    total_deduped = sum(r["deduped"] for r in per_source.values())
+    print(f"{'合计':<12}{total_fetched:>6}{total_errors:>6}{total_deduped:>6}")
+    print(f"[sources-check] 去重后素材 {len(out['materials'])} 条；"
+          f"外部请求 {out['external_calls']}")
+    for name, errs in (out.get("source_errors") or {}).items():
+        print(f"[sources-check] ⚠️ {name} 源错误 {len(errs)} 条：{str(errs[0])[:180]}")
+
+    stamp = iso_now().replace(":", "").replace("+", "_")
+    path = state_dir / f"sources_check_{stamp}.json"
+    payload = {
+        "time": iso_now(),
+        "command": "sources-check",
+        "sources": sources,
+        "per_source": per_source,
+        "totals": {"fetched": total_fetched, "errors": total_errors,
+                   "deduped": total_deduped,
+                   "materials_after_dedupe": len(out["materials"])},
+        "external_api_calls": out["external_calls"],
+        "validation_error_counts": out.get("validation_error_counts") or {},
+        "source_errors": out.get("source_errors") or {},
+        "items": out["materials"],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    print(f"[sources-check] 结果已写入 {path}")
+
+    record = append_cost(state_dir / "cost_log.jsonl", {
+        "command": "sources-check",
+        "provider": "无", "model": "无",
+        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+        "tokens": 0, "cost": 0,
+        "external_api_calls": out["external_calls"],
+        "note": "免费接口（AIHot/GitHub REST/RSS/Releases）；未使用 LLM",
+    })
+    print(f"[成本] provider={record['provider']} 金额={record['金额']}；"
+          f"外部请求={record['external_api_calls']}（免费接口）")
+    return 0
+
+
 # ---------------------------------------------------------------------- dry-state
 class _DryState:
     """dry-run 用的哑状态（不落盘）。"""
@@ -382,8 +534,18 @@ def main() -> int:
     p = sub.add_parser("collect", parents=[common], help="S1+S2+S3 → 停在 GATE-1")
     p.add_argument("--aihot-file", default="data/examples/aihot_fake_sample.json")
     p.add_argument("--x-following", default="/workspace/ai-zimeiti/inputs/x_following.json")
-    p.add_argument("--x-posts", default=None,
+    p.add_argument("--x-posts", "--x-file", dest="x_posts", default=None,
                    help="X 帖子文件（本地 JSON，任务05；只读不联网）")
+    p.add_argument("--sources", default="aihot,x",
+                   help="逗号分隔来源：aihot,github,official,x,import（默认保持 aihot,x）")
+    p.add_argument("--github-top", type=int, default=5,
+                   help="GitHub 每轮取前 N 个（默认 5）")
+    p.add_argument("--official-limit", type=int, default=3,
+                   help="每个官方源取最近 N 条（默认 3）")
+    p.add_argument("--import-file", default=None,
+                   help="国内统一导入 JSON/CSV（本地文件，不联网）")
+    p.add_argument("--config", default="config/sources.example.yaml",
+                   help="来源配置 YAML（GitHub 主题/官方源 URL）")
     p.add_argument("--live", action="store_true", help="真实拉取 aihot（≤20 条，默认离线回放）")
     p.add_argument("--audience", default="config/audience_profile.yaml",
                    help="受众画像 YAML（评分依据，任务05）")
@@ -413,6 +575,21 @@ def main() -> int:
     p = sub.add_parser("selfcheck", parents=[common], help="连通性自检（aihot 1 条 + Notion）")
     p.add_argument("--skip-aihot", action="store_true")
 
+    p = sub.add_parser("github", parents=[common],
+                       help="只做 GitHub 研究（真实 REST，输出 JSON+表格，不写 Notion）")
+    p.add_argument("--top", type=int, default=5)
+    p.add_argument("--config", default="config/sources.example.yaml")
+    p.add_argument("--snapshots", default=DEFAULT_SNAPSHOTS)
+
+    p = sub.add_parser("sources-check", parents=[common],
+                       help="真实小样：aihot+github+official+x+import → 校验/去重（不写 Notion）")
+    p.add_argument("--github-top", type=int, default=5)
+    p.add_argument("--official-limit", type=int, default=3)
+    p.add_argument("--aihot-limit", type=int, default=3)
+    p.add_argument("--x-file", dest="x_file", default=None)
+    p.add_argument("--import-file", default=None)
+    p.add_argument("--config", default="config/sources.example.yaml")
+
     args = ap.parse_args()
     if args.cmd == "collect":
         return cmd_collect(args)
@@ -429,6 +606,10 @@ def main() -> int:
         return cmd_status(args)
     if args.cmd == "selfcheck":
         return cmd_selfcheck(args)
+    if args.cmd == "github":
+        return cmd_github(args)
+    if args.cmd == "sources-check":
+        return cmd_sources_check(args)
     return 1
 
 

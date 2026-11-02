@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -32,6 +33,10 @@ VALID_SOURCE_TYPES = {
     "github_domestic",
     "feishu_domestic",
     "manual",
+    # 阶段2-B 新增（只增不改）
+    "github",
+    "official",
+    "import",
 }
 
 VALID_EVIDENCE_STATUS = {"verified", "self_reported", "third_party", "unverified"}
@@ -111,12 +116,126 @@ def normalize_aihot_item(raw: dict) -> dict:
         "tool_or_method": [],
         "duplicate_of": None,
         "processing_status": "new",
+        # 阶段2-B 统一字段（只增不改旧字段）
+        "platform": "aihot",
+        "origin_agent": "pi",
+        "keywords": [],
+        "comments": [],
+        "metrics": {},
+        "license_status": "公开",
+        "errors": [],
         "extra": {
             "category": raw.get("category"),
             "aihot_score": raw.get("score"),
             "reason": raw.get("reason") or "",
             "aihot_url": links.get("aihot", ""),
         },
+    }
+
+
+def normalize_github_item(raw: dict, github_extra: dict | None = None) -> dict:
+    """把 GitHub REST search/repositories 条目映射为统一素材（只读取公开元数据）。"""
+    full_name = raw.get("full_name") or raw.get("name") or str(raw.get("id") or "")
+    owner = (raw.get("owner") or {}).get("login") or full_name.split("/")[0]
+    description = (raw.get("description") or "").strip()
+    stars = raw.get("stargazers_count")
+    if not isinstance(stars, (int, float)):
+        stars = 0
+    topics = [str(t) for t in (raw.get("topics") or []) if t]
+    license_raw = raw.get("license") or {}
+    license_name = (license_raw.get("spdx_id") or license_raw.get("name")
+                    or "未标注")
+    html_url = raw.get("html_url") or ""
+    pushed = raw.get("pushed_at") or raw.get("updated_at") or None
+
+    github = {
+        "name": raw.get("name") or full_name,
+        "full_name": full_name,
+        "url": html_url,
+        "purpose": description or "待验证",
+        "stars": stars,
+        "last_update": pushed,
+        "latest_release": "无",
+        "license": license_name,
+        "install_difficulty": "待验证（推测）",
+        "needs_paid_api": "待验证",
+        "windows_support": "待验证",
+        "china_usability": "待验证",
+        "target_users": [],
+        "worth_video": "待验证（推测）",
+        "language": raw.get("language"),
+    }
+    if github_extra:
+        github.update(github_extra)
+
+    return {
+        "item_id": make_item_id("github", full_name or str(raw.get("id") or "")),
+        "source_type": "github",
+        "source_url": html_url,
+        "author_or_publisher": str(owner),
+        "published_at": pushed,
+        "collected_at": iso_now(),
+        "title_or_summary": f"{full_name}：{description}" if description else full_name,
+        "raw_reference": f"GitHub 官方 REST：{full_name}",
+        "claims": [description] if description else [],
+        "evidence_status": "verified",
+        "target_user_hypotheses": list(github.get("target_users") or []),
+        "user_problem_evidence": [],
+        "tool_or_method": topics,
+        "duplicate_of": None,
+        "processing_status": "new",
+        "platform": "github",
+        "origin_agent": "pi",
+        "keywords": topics,
+        "comments": [],
+        "metrics": {"stars": stars},
+        "license_status": "公开",
+        "errors": [],
+        "extra": {"github": github},
+    }
+
+
+def normalize_official_item(raw: dict, source: dict) -> dict:
+    """把官方 RSS/Atom/Releases 条目映射为统一素材。
+
+    raw 由 official_source 解析成统一中间结构：id/url/title/summary/published_at。
+    """
+    url = (raw.get("url") or "").strip()
+    title = (raw.get("title") or "").strip()
+    summary = (raw.get("summary") or "").strip()
+    key = raw.get("id") or hashlib.sha1(
+        f"{source.get('id', '')}|{url}|{title}".encode("utf-8")).hexdigest()[:16]
+    source_name = source.get("name") or source.get("id") or "官方源"
+    extra_official = {
+        "source_id": source.get("id"),
+        "source_name": source_name,
+        "source_type": source.get("type"),
+    }
+    extra_official.update(raw.get("extra") or {})
+    return {
+        "item_id": make_item_id("official", str(key)),
+        "source_type": "official",
+        "source_url": url,
+        "author_or_publisher": source_name,
+        "published_at": raw.get("published_at") or None,
+        "collected_at": iso_now(),
+        "title_or_summary": f"{title} {summary}".strip()[:800],
+        "raw_reference": f"官方源：{source_name}",
+        "claims": [summary] if summary else ([title] if title else []),
+        "evidence_status": "verified",
+        "target_user_hypotheses": [],
+        "user_problem_evidence": [],
+        "tool_or_method": [],
+        "duplicate_of": None,
+        "processing_status": "new",
+        "platform": "official",
+        "origin_agent": "pi",
+        "keywords": [],
+        "comments": [],
+        "metrics": {},
+        "license_status": "公开",
+        "errors": [],
+        "extra": {"official": extra_official},
     }
 
 
