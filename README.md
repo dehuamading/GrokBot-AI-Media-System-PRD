@@ -1,5 +1,32 @@
 # GrokBot AI 自媒体系统（AI-Media Brain）
 
+> **v2 升级（分支 upgrade/v2，2026-11）当前能力**：多来源采集 → 用户需求识别 → 新技术机会发现 → 双引擎选题（v3-dual 评分）→ 偏好学习 → 单稿文案 → Notion 沉淀。全部手动触发，无定时任务；两道人工关口（GATE-1 选题、GATE-2 审稿），系统没有任何发布代码路径。详见 docs/upgrade-v2/final-report.md。
+
+## v2 命令速查（手动触发）
+```bash
+export NOTION_TOKEN=$(cat /workspace/.secrets/notion_token)   # 绝不打印、绝不提交
+source /workspace/ai-zimeiti/llm-env.sh                       # 模型 key（OpenCode Go→GLM→DeepSeek），只放仓库外
+python3 -m src.workflows.run sources-check --github-top 5 [--write-notion --max-rows 10]   # 采集小样；写 01 只增、按 item_id 去重
+python3 -m src.workflows.run topics-round --sources aihot,github,official,x \
+   --x-file <Grok Bot 交付的 X 帖子文件> --x-replies-file <X 公开回复文件> --max-cards 10 --write-notion   # 到 GATE-1
+python3 -m src.workflows.run feedback --topic <id> --pick 认可|一般|未选|否决 --say "原话"          # 写 05，认可另写认可素材
+python3 -m src.workflows.run rules --propose        # 每 3 轮生成候选规则（待确认，绝不自动生效）
+python3 -m src.workflows.run draft --topic <id> --llm chain --no-paid --export-dir <dir>         # 只为选中卡写稿 → 04 待审核 → GATE-2
+```
+| 模块 | 文件 |
+|---|---|
+| 来源 | src/connectors/{aihot,github,official,x_posts,import}_source.py（国内平台只留导入接口，见 docs/import-schema.md） |
+| 校验/去重 | src/validate.py、src/normalize.py |
+| 需求引擎（10 类，LLM+关键词回退，证据脱敏） | src/analysis/demand.py |
+| 评分 v3-dual（9 维满分 18，传播潜力不计分，≥12 且轨道分≥3 推荐 / ≥9 备选） | src/analysis/scoring.py |
+| 偏好学习（05 反馈/认可素材/正在使用规则注入提示词） | src/analysis/preference.py |
+| 隐私与安全（X 用户名/正文、注册翻墙等敏感步骤、收益承诺拦截） | src/analysis/privacy.py、src/analysis/safety.py |
+| 模型供应链与成本（未知记“未知”，OpenCode list_cost 为套餐折算非实付） | src/llm/provider_chain.py、src/cost_log.py |
+| 文案 | src/llm/draft_writer.py |
+
+---
+
+
 以 X 关注账号为首要情报源、aihot.news 为核心补充的中文 AI 自媒体「情报 → 选题 → 单稿 → 复盘 → 知识沉淀」系统。按仓库根目录 PRD 文档分阶段实施（P0→P6）。
 
 ## 工作流（任务03 已实现，见 docs/workflow-design.md；任务05 增 X 帖子文件输入 + 受众画像 + GLM 分析）
