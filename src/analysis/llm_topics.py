@@ -21,8 +21,10 @@ from datetime import datetime, timezone
 from src.analysis.audience import AudienceProfile, match_audience
 from src.analysis.demand import short_evidence_texts
 from src.analysis.fields import (audience_user, filled, normalize_china_usability,
-                                 paid_label)
-from src.analysis.scoring import SCORING_VERSION_V3, score_item_v3
+                                 paid_label, parse_audience_categories)
+from src.analysis.scoring import (OVERSEAS_OPPORTUNITY_LABEL,
+                                  SCORING_VERSION_V3, score_item_v3)
+from src.analysis.safety import scrub_card_forbidden_steps
 from src.llm.glm import GLMChat, GLMParseError
 
 ENGLISH_STOP = re.compile(r"[a-zA-Z]")
@@ -190,8 +192,9 @@ CARD_SYSTEM = (
     "5) platform ∈ {抖音,小红书,两者}；score 为你给的 0-10 综合分；\n"
     "6) 标题必须是中文概括改写，禁止照抄帖子原文（尤其禁止连续 >20 字原文），"
     "禁止写入作者显示名、username 或 @handle；引用链接由程序从素材注入；\n"
-    "7) 新字段必须尽量给出：target_user（从 AI普通使用者/AI内容创作者/"
-    "AI编程与应用开发者/AI副业与创业探索者/国外AI工具的国内使用者 中选最匹配项）、"
+    "7) 新字段必须尽量给出：target_user（只能从白名单选，可多选，用“、”连接："
+    "AI普通使用者、AI内容创作者、AI编程与应用开发者、AI副业与创业探索者、"
+    "国外AI工具的国内使用者；不确定则写“待验证”）、"
     "pain_or_opportunity、why_now、angle、paid（是否付费）、verifiable（能否实际验证）；"
     "确实不知道才写「待验证」，不得用空话；\n"
     '严格只输出 JSON：{"cards":[{"title":"…","why_fit":"…","hook":"…","refs":[1],'
@@ -362,7 +365,7 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
                    + "；".join(f"「{e}」" for e in demand_evidence)
                    if demand_evidence else
                    "待验证：本轮引用素材无直接评论证据；须在文案阶段补证")
-    return {
+    card = {
         "topic_id": f"TX-{now.strftime('%Y%m%d')}-{seq:03d}",
         "拟定标题": title,
         "建议平台": platform,
@@ -392,10 +395,11 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         # 阶段3 新字段（只增不改旧字段；空/未知统一「待验证」）
         "类型": chosen_type,
         "选题类型": chosen_type,
-        "面向用户": audience_user(
-            filled(raw.get("target_user")) or
-            f"{profile.name}（画像 {profile.profile_id}）",
-            title, why, hook, primary_text),
+        "面向用户": (
+            "、".join(parse_audience_categories(filled(raw.get("target_user"))))
+            if parse_audience_categories(filled(raw.get("target_user"))) else
+            audience_user("", title, why, hook, primary_text,
+                          filled(raw.get("target_user")))),
         "痛点或机会": filled(raw.get("pain_or_opportunity")) or why,
         "原始来源": source_urls[0],
         "为何现在做": filled(raw.get("why_now")) or why_now,
@@ -411,9 +415,21 @@ def _assemble_card(raw: dict, by_n: dict[int, dict], profile: AudienceProfile,
         "副业证据等级": v3["side_hustle_evidence_level"],
         "传播潜力假设(不计分)": v3["propagation_hypothesis"]["text"],
         "_v3": v3,
-    }, ""
+    }
+    if v3.get("overseas_new_opportunity"):
+        card["国内可用"] = OVERSEAS_OPPORTUNITY_LABEL
+        card["国外新机会"] = OVERSEAS_OPPORTUNITY_LABEL
+        scrub_card_forbidden_steps(card)
+    return card, ""
 
 
 def _pending(value) -> str:
     text = str(value or "").strip()
-    return text if text and text not in ("未知", "待核实", "待确认") else "待验证"
+    if not text or text in ("未知", "待核实", "待确认"):
+        return "待验证"
+    if text.startswith("待验证：待验证"):
+        text = "待验证" + text[len("待验证：待验证"):]
+    if text.startswith("待验证："):
+        rest = text[len("待验证："):].strip()
+        return "待验证" if not rest else f"待验证：{rest}"
+    return text

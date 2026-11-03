@@ -291,7 +291,14 @@ def step_write_raw_materials_if_absent(client, db_ids, materials: list[dict], *,
 
 def _pending(value) -> str:
     text = str(value or "").strip()
-    return text if text and text not in ("未知", "待核实", "待确认") else "待验证"
+    if not text or text in ("未知", "待核实", "待确认"):
+        return "待验证"
+    if text.startswith("待验证：待验证"):
+        text = "待验证" + text[len("待验证：待验证"):]
+    if text.startswith("待验证："):
+        rest = text[len("待验证："):].strip()
+        return "待验证" if not rest else f"待验证：{rest}"
+    return text
 
 
 def step_write_topics(client, db_ids, cards: list[dict],

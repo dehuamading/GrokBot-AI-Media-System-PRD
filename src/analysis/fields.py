@@ -52,28 +52,68 @@ def filled(value) -> str:
     return "" if text.lower() in _UNKNOWN else text
 
 
+def _dedupe_prefix(text: str, label: str) -> str:
+    """去掉重复的标签前缀，例如“待验证：待验证” → “待验证”。"""
+    value = str(text or "").strip()
+    if not value:
+        return label
+    if value == label:
+        return label
+    prefix = f"{label}："
+    while value.startswith(prefix):
+        value = value[len(prefix):].strip()
+    # 兼容半角冒号与重复标签本身。
+    prefix_ascii = f"{label}:"
+    while value.startswith(prefix_ascii):
+        value = value[len(prefix_ascii):].strip()
+    if not value or value == label:
+        return label
+    return f"{label}：{value}"
+
+
 def audience_category(*texts) -> str:
     """从 5 类目标受众中选匹配项；无信号时落到「AI普通使用者」。"""
+    categories = infer_audience_categories(*texts)
+    return categories[0] if categories else "AI普通使用者"
+
+
+def parse_audience_categories(value) -> list[str]:
+    """解析文本中出现的白名单受众；可多个，按白名单顺序返回。"""
+    text = str(value or "")
+    return [name for name in AUDIENCE_CATEGORIES if name in text]
+
+
+def infer_audience_categories(*texts) -> list[str]:
+    """规则推断受众类别（可多个）；无信号时回退 AI普通使用者。"""
     haystack = " ".join(str(t or "") for t in texts).lower()
     if not haystack.strip():
-        return "AI普通使用者"
+        return ["AI普通使用者"]
     scores = {
         name: sum(1 for word in words if word.lower() in haystack)
         for name, words in _AUDIENCE_KEYWORDS.items()
     }
-    best = max(AUDIENCE_CATEGORIES, key=lambda name: (scores[name], -AUDIENCE_CATEGORIES.index(name)))
-    return best if scores[best] else "AI普通使用者"
+    matched = [name for name in AUDIENCE_CATEGORIES if scores[name] > 0]
+    if not matched:
+        return ["AI普通使用者"]
+    # 多个命中时最多保留 3 类，避免把弱相关的类别全部贴上。
+    matched.sort(key=lambda name: (-scores[name], AUDIENCE_CATEGORIES.index(name)))
+    return matched[:3]
 
 
 def audience_user(old_value, *extra_texts) -> str:
-    """面向用户：优先旧「面向谁」，并附上 5 类受众中的匹配项。"""
+    """面向用户：映射到 5 类白名单受众（可多个，用“、”连接）。
+
+    旧字段已有描述时保留描述，并附上规则/LLM 给出的类别；若旧值本身已是
+    白名单类别（或 LLM 只返回类别），则直接输出类别列表，避免重复。
+    """
     base = filled(old_value)
+    explicit = parse_audience_categories(base)
+    if explicit:
+        return "、".join(explicit)
+    categories = infer_audience_categories(base, *extra_texts)
     if not base:
-        base = "待验证"
-    category = audience_category(base, *extra_texts)
-    if "受众匹配" in base or category in base:
-        return base
-    return f"{base}（受众匹配：{category}）"
+        return "、".join(categories)
+    return f"{base}（受众匹配：{'、'.join(categories)}）"
 
 
 def normalize_china_usability(value) -> str:
@@ -81,6 +121,8 @@ def normalize_china_usability(value) -> str:
     text = filled(value)
     if not text:
         return "待验证"
+    if text.startswith("国外新机会"):
+        return text
     if any(k in text for k in ("不可用", "无法访问", "被墙", "封禁", "不支持国内")):
         label = "不可用"
     elif any(k in text for k in ("外币卡", "国外信用卡", "境外卡",
@@ -92,10 +134,8 @@ def normalize_china_usability(value) -> str:
                                  "无需翻墙", "支持国内")):
         label = "可用"
     else:
-        return f"待验证：{text}"
-    if text.startswith(label):
-        return text
-    return f"{label}：{text}"
+        return _dedupe_prefix(text, "待验证")
+    return _dedupe_prefix(text, label)
 
 
 def paid_label(value) -> str:

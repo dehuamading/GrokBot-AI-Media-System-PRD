@@ -339,7 +339,7 @@ def test_repair_round_updates_only_round_topic_ids_and_preserves_user_choice(
                   "OpenAI 发布真实新模型，零基础教程国内可用"),
         _material("x_posts:real-2", "x_posts",
                   "真实 X 帖子：AI 副业接单实测，国内可用",
-                  url="https://x.com/real_user/status/2"),
+                  url="https://x.com/example_real_user/status/2"),
     ]
     out = {
         "materials": real, "dropped": [], "snapshot": None, "x_posts": 1,

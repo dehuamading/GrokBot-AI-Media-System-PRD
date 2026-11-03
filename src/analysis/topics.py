@@ -14,6 +14,7 @@ from src.analysis.classify import classify_item
 from src.analysis.demand import short_evidence_texts
 from src.analysis.privacy import (is_x_material, keyword_summary,
                                   sanitize_card)
+from src.analysis.safety import scrub_card_forbidden_steps
 from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,
                                   score_item, score_item_v3)
 
@@ -117,6 +118,8 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
             "原始来源": it["source_url"],
             "为何现在做": why_now,
             "国内可用": _china_label(v3),
+            "国外新机会": (_china_label(v3)
+                         if v3.get("overseas_new_opportunity") else ""),
             "是否付费": _paid_label((it.get("title_or_summary") or "")
                                    + " " + " ".join(it.get("claims") or [])),
             "能否实际验证": "可验证：有原始出处链接" if it.get("source_url") else "待验证",
@@ -131,11 +134,17 @@ def build_topic_cards(materials: list[dict], top_k: int = 8,
             "_v3": v3,
         }
         # 所有出卡路径统一清洗，避免任何调用方忘记脱敏。
-        cards.append(sanitize_card(card, [it]))
+        card = sanitize_card(card, [it])
+        if v3.get("overseas_new_opportunity"):
+            scrub_card_forbidden_steps(card)
+        cards.append(card)
     return cards, details
 
 
 def _china_label(v3: dict) -> str:
+    if v3.get("overseas_new_opportunity"):
+        from src.analysis.scoring import OVERSEAS_OPPORTUNITY_LABEL
+        return OVERSEAS_OPPORTUNITY_LABEL
     if v3.get("china_pending"):
         return "待验证"
     dim = next((d for d in v3["dimensions"] if d["name"] == "国内适用性"), None)

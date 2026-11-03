@@ -31,8 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.analysis.audience import load_profile  # noqa: E402
 from src.analysis.fields import (audience_user, filled,  # noqa: E402
                                  is_simulated_source,
-                                 normalize_china_usability, paid_label)
-from src.analysis.scoring import (SCORING_VERSION, SCORING_VERSION_V3,  # noqa: E402
+                                 normalize_china_usability, paid_label,
+                                 parse_audience_categories)
+from src.analysis.safety import scrub_card_forbidden_steps  # noqa: E402
+from src.analysis.scoring import (OVERSEAS_OPPORTUNITY_LABEL,  # noqa: E402
+                                  SCORING_VERSION, SCORING_VERSION_V3,
                                   merge_dual_tracks, score_item_v3)
 from src.connectors.github_source import (DEFAULT_SNAPSHOTS, fetch_github,  # noqa: E402
                                           load_config as load_github_config)
@@ -343,6 +346,180 @@ def _do_draft(args, state, client, db_ids, selections) -> int:
         print(f"  ✍️ {d['draft_id']} → {d['notion_page']}")
     print("⏸ GATE-2（第二人工关口）：请在 Notion「04_文案与版本」审阅初稿："
           "状态改 已确认 或 修订中（附反馈）。系统无发布能力，绝不自动发布。")
+    return 0
+
+
+def _log_draft_cost(args, chat, drafts: list[dict]) -> dict:
+    """draft 成本日志：未知=未知；OpenCode list_cost 标注套餐额度折算非实付。"""
+    path = Path(args.state).parent / "cost_log.jsonl"
+    if chat is None:
+        stats = {"calls": 0, "prompt_tokens": UNKNOWN,
+                 "completion_tokens": UNKNOWN, "tokens": UNKNOWN,
+                 "cost": UNKNOWN, "cost_basis": NO_LLM_COST_BASIS,
+                 "list_cost": UNKNOWN, "list_cost_basis": UNKNOWN}
+        provider, model = "无", "无"
+    else:
+        stats = _aggregate_usage(chat)
+        provider = getattr(chat, "last_provider", None) or getattr(
+            chat, "model", UNKNOWN)
+        model = getattr(chat, "last_model", None) or getattr(
+            chat, "model", UNKNOWN)
+    note = ("文案生成；list_cost 为套餐额度折算（非实付），未知写「未知」；"
+            "未调用发布接口")
+    record = append_cost(path, {
+        "command": ("draft --topic " +
+                    ",".join(getattr(args, "topic", []) or []) +
+                    f" --llm {getattr(args, 'llm', 'chain')}"),
+        "provider": provider, "model": model,
+        **stats,
+        "external_api_calls": {},
+        "note": note,
+    })
+    print(f"[成本] provider={record['provider']} model={record['model']}；"
+          f"调用 {record['calls']} 次，tokens={record['tokens']}，"
+          f"金额={record['金额']}（套餐额度折算非实付；未知=未知）")
+    return record
+
+
+def _expand_topic_args(raw) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[str] = []
+    for value in raw:
+        for topic in re.split(r"[,，\s]+", str(value or "")):
+            if topic and topic not in out:
+                out.append(topic)
+    return out
+
+
+def _single_draft_platform(card: dict) -> str:
+    """RULE-001：一卡一稿；“两者”只写一份通用稿并标注平台=两者。"""
+    value = (filled(card.get("用户指定平台")) or filled(card.get("建议平台"))
+             or filled(card.get("platform")) or "两者")
+    return value if value in ("抖音", "小红书", "两者") else "两者"
+
+
+def cmd_draft(args, client=None, chat=None) -> int:
+    """阶段4：按 --topic 读取 03 全字段 + 05 规则/反馈 → 写 04 → 停 GATE-2。"""
+    from src.analysis import preference
+    from src.llm.draft_writer import (DraftWriter, build_draft_injection,
+                                      finalize_draft, render_markdown)
+    from src.notion_store.gates import (read_topic_cards_by_ids,
+                                        write_draft_row_pending)
+
+    state = WorkflowState(args.state).load()
+    client = client or NotionClient()
+    db_ids = state.get("db_ids") or ensure_kb(client, args.page_id)
+    ensure_kb_upgrades(client, db_ids)
+
+    topic_ids = _expand_topic_args(getattr(args, "topic", None))
+    if topic_ids:
+        cards = read_topic_cards_by_ids(client, db_ids, topic_ids)
+        missing = [tid for tid in topic_ids if tid not in
+                   {c.get("topic_id") for c in cards}]
+        if missing:
+            print(f"❌ 03 中找不到 topic_id：{missing}")
+        if not cards:
+            print("⏸ GATE-1：未找到可写选题卡，未生成任何文案。")
+            return 1
+        unselected = [c.get("topic_id") for c in cards
+                      if c.get("用户选择结果") != "已选定"]
+        if unselected:
+            print(f"⚠️ 显式 --topic 指定了未标记已选定的卡：{unselected}"
+                  "（按用户手动指定继续；仍停在 GATE-2，不会发布）")
+    else:
+        cards = pipeline.step_gate1(client, db_ids)
+        if not cards:
+            print("⏸ GATE-1：尚未检出任何「已选定」选题（Notion 03_选题决策）。等待用户操作。")
+            return 0
+
+    try:
+        materials = _load_materials_from_state(state)
+    except SystemExit:
+        print("⚠️ 本地无素材快照（如直接沿用已在库选题卡），"
+              "初稿事实清单将只使用卡片原始来源。")
+        materials = []
+
+    prefs = {"approved": [], "rejected": [], "neutral": [],
+             "unpicked": [], "rules": [], "candidate_rules": []}
+    if db_ids.get("05_经验与复盘"):
+        prefs = preference.load_recent_preferences(client, db_ids)
+    mat_by_id = {m["item_id"]: m for m in materials}
+    llm_name = getattr(args, "llm", "chain")
+    if llm_name == "template":
+        # 显式 template 时不使用任何 LLM（即使调用方误传了 chat）。
+        chat = None
+    if llm_name == "chain" and chat is None:
+        from src.llm.provider_chain import ProviderChain
+        try:
+            chat = ProviderChain(exclude_paid=bool(getattr(args, "no_paid", True)))
+        except Exception as exc:  # noqa: BLE001 - 无配置时回退模板
+            print(f"⚠️ chain 初始化失败，回退模板：{type(exc).__name__}: {exc}")
+            chat = None
+    openai_client = None
+    if llm_name == "openai-compat" and chat is None:
+        from src.llm.openai_compat import OpenAICompatClient
+        openai_client = OpenAICompatClient()
+
+    export_dir = getattr(args, "export_dir", None)
+    if export_dir:
+        Path(export_dir).mkdir(parents=True, exist_ok=True)
+
+    results: list[dict] = []
+    for card in cards:
+        topic_id = card.get("topic_id")
+        rel_mats = [mat_by_id[iid] for iid in card.get("关联素材") or []
+                    if iid in mat_by_id]
+        if card.get("关联素材") and len(rel_mats) < len(card["关联素材"]):
+            missing_ids = set(card["关联素材"]) - set(mat_by_id)
+            print(f"⚠️ {topic_id} 有关联素材不在本地快照：{missing_ids}"
+                  "（事实清单仅使用卡片来源）")
+        feedbacks = (preference.load_feedback_for_topic(client, db_ids, topic_id)
+                     if db_ids.get("05_经验与复盘") else [])
+        injection = build_draft_injection(card, prefs, feedbacks)
+        inject_path = (Path(args.state).parent /
+                       f"draft_injection_{topic_id}.txt")
+        inject_path.parent.mkdir(parents=True, exist_ok=True)
+        inject_path.write_text(injection, encoding="utf-8")
+
+        platform = _single_draft_platform(card)
+        if openai_client is not None:
+            target = "抖音" if platform == "两者" else platform
+            raw = openai_client.generate(target, card, rel_mats)
+            raw.platform = platform
+            draft = finalize_draft(raw, card, rel_mats, platform=platform)
+        else:
+            writer = DraftWriter(chat=chat, fallback=TemplateClient(),
+                                 injection_text=injection)
+            draft = writer.generate(platform, card, rel_mats)
+        draft.draft_id = f"D-{topic_id}-{platform}-v{draft.version}"
+        page_id, created = write_draft_row_pending(
+            client, db_ids, draft, topic_id)
+        results.append({"draft_id": draft.draft_id, "topic_id": topic_id,
+                        "platform": platform, "notion_page": page_id,
+                        "created": created, "engine": draft.engine})
+        if export_dir:
+            path = Path(export_dir) / f"{topic_id}.md"
+            path.write_text(render_markdown(draft), encoding="utf-8")
+            print(f"  📄 导出：{path}")
+        print(f"  ✍️ {draft.draft_id} [{platform}] 生成引擎={draft.engine}"
+              f" → {page_id}")
+
+    state.update(last_draft={"drafts": results},
+                 gate2={"status": "waiting", "drafts": results})
+    try:
+        state.set_stage("drafted")
+        state.set_stage("waiting_gate2")
+    except ValueError:
+        state.update(stage="waiting_gate2")
+    state.save()
+
+    _log_draft_cost(args, chat, results)
+    print("⏸ GATE-2：等待用户审核，未发布。")
+    print("ℹ️ 系统无发布能力；请在 Notion「04_文案与版本」人工审阅，"
+          "状态改 已确认 或 修订中（附反馈）。")
     return 0
 
 
@@ -891,8 +1068,12 @@ def _postprocess_round_cards(cards: list[dict], materials: list[dict], *,
         material_text = " ".join(
             str(m.get("title_or_summary") or "") for m in mats)
         old_audience = filled(c.get("面向谁"))
+        existing_user = filled(c.get("面向用户"))
+        audience_input = (existing_user
+                          if parse_audience_categories(existing_user)
+                          else (old_audience or existing_user or "待验证"))
         c["面向用户"] = audience_user(
-            old_audience or filled(c.get("面向用户")) or "待验证",
+            audience_input,
             c.get("拟定标题"), c.get("核心价值"), c.get("为什么适合"),
             material_text)
         c["痛点或机会"] = (filled(c.get("痛点或机会"))
@@ -903,6 +1084,9 @@ def _postprocess_round_cards(cards: list[dict], materials: list[dict], *,
                            or filled(c.get("为什么现在")) or "待验证")
         c["国内可用"] = normalize_china_usability(
             filled(c.get("国内可用")) or filled(c.get("国内可用性")))
+        if v3.get("overseas_new_opportunity"):
+            c["国内可用"] = OVERSEAS_OPPORTUNITY_LABEL
+            c["国外新机会"] = OVERSEAS_OPPORTUNITY_LABEL
         c["是否付费"] = (filled(c.get("是否付费"))
                          or paid_label(material_text))
         c["能否实际验证"] = (filled(c.get("能否实际验证"))
@@ -913,6 +1097,9 @@ def _postprocess_round_cards(cards: list[dict], materials: list[dict], *,
         c["主要风险"] = (filled(c.get("主要风险"))
                          or filled(c.get("可信度与风险")) or "待验证")
         c["引用帖子"] = "；".join(source_urls)  # X 卡只放 url，不写用户名/正文全文
+        # 规则2：国外新工具卡不得出现注册/翻墙/VPN 等开通步骤；只讲能力。
+        if v3.get("overseas_new_opportunity"):
+            scrub_card_forbidden_steps(c)
         c.setdefault("生成引擎", "启发式")
         c["_source_urls"] = source_urls
         c["_v3"] = v3
@@ -1607,8 +1794,19 @@ def main() -> int:
     p.add_argument("--draft", action="store_true")
     p.add_argument("--llm", default="template")
 
-    p = sub.add_parser("draft", parents=[common], help="GATE-1 通过后生成初稿（停在 GATE-2）")
-    p.add_argument("--llm", default="template", choices=["template", "openai-compat"])
+    p = sub.add_parser("draft", parents=[common],
+                       help="按选题卡生成初稿（默认 chain，失败回退模板；停在 GATE-2）")
+    p.add_argument("--topic", action="append", default=[],
+                   help="topic_id（可重复，也可逗号分隔）；不传则读取 GATE-1 已选定卡")
+    p.add_argument("--llm", default="chain",
+                   choices=["chain", "template", "openai-compat"],
+                   help="chain=OpenCode Go→GLM→DeepSeek；失败回退 template_client")
+    p.add_argument("--no-paid", dest="no_paid", action="store_true", default=True,
+                   help="默认开启：排除 DeepSeek 等付费提供方")
+    p.add_argument("--paid", dest="no_paid", action="store_false",
+                   help="允许付费提供方（默认不开启）")
+    p.add_argument("--export-dir", default=None,
+                   help="同时导出 markdown：<dir>/<topic_id>.md")
 
     sub.add_parser("gate2", parents=[common], help="读取 GATE-2 各稿状态")
     p = sub.add_parser("status", parents=[common], help="本地状态")
@@ -1642,7 +1840,8 @@ def main() -> int:
     p = sub.add_parser("feedback", parents=[common],
                        help="记录 GATE-1 反馈到 05（不改 03）")
     p.add_argument("--topic", required=True, help="topic_id（如 TX-20261102-V01）")
-    p.add_argument("--pick", required=True, choices=["认可", "一般", "否决"])
+    p.add_argument("--pick", required=True,
+                   choices=["认可", "一般", "否决", "未选"])
     p.add_argument("--say", required=True, help="用户原话反馈")
     p.add_argument("--reason", default="", help="原因标签")
     p.add_argument("--round", type=int, default=None, help="反馈轮次")
@@ -1701,7 +1900,7 @@ def main() -> int:
         args.llm = getattr(args, "llm", "template")
         return cmd_gate1(args, auto_draft=args.draft)
     if args.cmd == "draft":
-        return cmd_gate1(args, auto_draft=True)
+        return cmd_draft(args)
     if args.cmd == "gate2":
         return cmd_gate2(args)
     if args.cmd == "status":

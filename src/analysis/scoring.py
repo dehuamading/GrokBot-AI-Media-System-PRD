@@ -195,40 +195,82 @@ def _side_hustle(item: dict, text: str) -> tuple[int, str, str]:
     return 0, "无证据", "未提供副业相关证据"
 
 
-def _china_usability(item: dict, text: str) -> tuple[int, str, bool]:
-    """国内适用性：可用 2 / 需梯子或外币卡 1 / 不可用 0 / 待验证 0。"""
+_OVERSEAS_SIGNALS = ("国外", "海外", "境外", "外国", "global", "overseas")
+_RESTRICTED_SIGNALS = ("国内暂不可用", "国内不可用", "暂不可用", "无法访问",
+                       "被墙", "封禁", "不支持国内", "需要梯子", "需梯子",
+                       "翻墙", "科学上网", "外币卡", "国外信用卡", "境外卡",
+                       "需要订阅", "需付费", "付费订阅", "受限")
+_NEW_TOOL_SIGNALS = ("新工具", "新模型", "新功能", "新能力", "刚出",
+                     "刚发布", "首次", "首个", "发布", "上线", "突破",
+                     "降低门槛")
+OVERSEAS_OPPORTUNITY_LABEL = "国外新机会（国内暂不可用，只讲能力不讲开通）"
+
+
+def _overseas_new_tool(item: dict, text: str) -> bool:
+    """识别“国外刚出、国内暂不可用”的新工具机会（规则2）。"""
+    explicit = str(item.get("china_usability") or item.get("国内可用性")
+                   or (item.get("extra") or {}).get("china_usability") or "")
+    extra = item.get("extra") or {}
+    flagged = any(item.get(k) is True for k in (
+        "overseas", "is_overseas", "overseas_new", "foreign")) or any(
+        extra.get(k) is True for k in ("overseas", "is_overseas",
+                                      "overseas_new", "foreign"))
+    blob = (explicit + " " + str(text or "")).lower()
+    overseas = flagged or any(k.lower() in blob for k in _OVERSEAS_SIGNALS)
+    new_tool = any(k.lower() in blob for k in _NEW_TOOL_SIGNALS)
+    restricted = any(k.lower() in blob for k in _RESTRICTED_SIGNALS)
+    return bool((overseas and (new_tool or restricted))
+                or (restricted and new_tool))
+
+
+def _china_usability(item: dict, text: str) -> tuple[int, str, bool, bool]:
+    """国内适用性：可用 2 / 国外新机会、需梯子或外币卡 1 / 待验证 0。
+
+    规则2：国外刚出、国内暂不可用的新工具也是重点机会。此时该维给中性
+    1 分（不是 0），并在理由中明确“只讲能力不讲开通”；新技术机会维度照常计分。
+    """
     explicit = (item.get("china_usability") or item.get("国内可用性")
                 or (item.get("extra") or {}).get("china_usability") or "")
     explicit = str(explicit).strip()
+    explicit_blob = (explicit + " " + str(text or "")).lower()
+    explicit_restricted = any(k.lower() in explicit_blob
+                              for k in _RESTRICTED_SIGNALS)
+    explicit_positive = any(k in explicit for k in ("可用", "能用")) and \
+        not explicit_restricted
+
     if explicit:
-        if any(k in explicit for k in ("不可用", "无法访问", "被墙", "封禁")):
-            return 0, f"素材标注：{explicit}", False
-        if any(k in explicit for k in ("需梯子", "外币卡", "需要订阅", "需付费", "受限")):
-            return 1, f"素材标注：{explicit}", False
         if any(k in explicit for k in ("待验证", "未知", "不确定")):
-            return 0, f"素材标注：{explicit}（待验证）", True
-        if "可用" in explicit or "能用" in explicit:
-            return 2, f"素材标注：{explicit}", False
+            return 0, f"素材标注：{explicit}（待验证）", True, False
+        if explicit_positive:
+            return 2, f"素材标注：{explicit}", False, False
+        if explicit_restricted:
+            overseas = _overseas_new_tool(item, text)
+            reason = (OVERSEAS_OPPORTUNITY_LABEL if overseas else
+                      f"素材标注：{explicit}（国内暂不可用，只讲能力不讲开通）")
+            return 1, reason, False, overseas
 
     # 疑问句不是可用性证据，必须在“可用”等肯定字样之前判定。
     if any(k in text for k in ("吗", "？", "?", "么")):
-        return 0, "待验证：文本是询问而非可用性证据", True
-    if any(k in text for k in ("国内不可用", "无法访问", "被墙", "封禁", "不支持国内")):
-        return 0, "文本提示国内不可用", False
+        return 0, "待验证：文本是询问而非可用性证据", True, False
     if any(k in text for k in ("国内可用", "国内能用", "不用翻墙", "免翻墙",
                                "无需翻墙", "直接可用", "支持国内", "国内直接")):
-        return 2, "文本提示国内可直接使用", False
-    if any(k in text for k in ("需要梯子", "需梯子", "翻墙", "科学上网",
-                               "外币卡", "国外信用卡", "需要订阅", "需付费")):
-        return 1, "文本提示需要梯子/外币卡/付费订阅", False
-    return 0, "待验证：未取得国内可用性证据", True
+        return 2, "文本提示国内可直接使用", False, False
+    if any(k in text for k in _RESTRICTED_SIGNALS):
+        overseas = _overseas_new_tool(item, text)
+        reason = (OVERSEAS_OPPORTUNITY_LABEL if overseas else
+                  "文本提示国内暂不可用（只讲能力不讲开通）")
+        return 1, reason, False, overseas
+    if _overseas_new_tool(item, text):
+        return 1, OVERSEAS_OPPORTUNITY_LABEL, False, True
+    return 0, "待验证：未取得国内可用性证据", True, False
 
 
 def _new_tech_opportunity(item: dict, text: str) -> tuple[int, str]:
     cat = (item.get("extra") or {}).get("category") or ""
     signals = [k for k in ("新能力", "新模型", "新功能", "首次", "首个", "突破",
                            "多模态", "agent", "智能体", "降低门槛", "零基础",
-                           "免费", "开源", "降价", "成本降低", "效率提升")
+                           "免费", "开源", "降价", "成本降低", "效率提升",
+                           "新工具", "刚发布", "上线")
                if k in text]
     if cat in ("ai-products", "ai-models"):
         signals.append(f"类目 {cat}")
@@ -377,8 +419,8 @@ def score_item_v3(item: dict, now: datetime | None = None,
           "需自行核验部分事实" if cost_pts == 1 else
           f"涉及 {costly[:2]}，事实核验/素材成本高")
 
-    # 7) 国内适用性
-    china_pts, r7, china_pending = _china_usability(item, text)
+    # 7) 国内适用性（规则2：国外新工具给中性 1 分，不因暂不可用扣成 0）
+    china_pts, r7, china_pending, overseas_new = _china_usability(item, text)
     if china_pending:
         r7 = "待验证：" + r7.replace("待验证：", "")
 
@@ -438,6 +480,8 @@ def score_item_v3(item: dict, now: datetime | None = None,
         "demand_evidence_count": len(evidence),
         "demand_evidence": sanitized_evidence,
         "china_pending": china_pending,
+        "overseas_new_opportunity": overseas_new,
+        "china_label": (OVERSEAS_OPPORTUNITY_LABEL if overseas_new else ""),
         "notes": ("九维启发式评分（v3-dual，未验证），仅用于排序辅助，"
                   "不承诺传播效果；传播潜力假设不计分"),
     }

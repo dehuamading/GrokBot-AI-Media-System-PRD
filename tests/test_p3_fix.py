@@ -239,7 +239,7 @@ def _raw_windows(text, width=21):
 def test_x_card_titles_are_paraphrased_and_never_contain_raw_post_or_handle():
     raw = "这是一段超过二十个字的X帖子正文原文，里面还带着用户名@alice和真实内容"
     mat = _material("x_posts:1", "x_posts", raw,
-                    url="https://x.com/alice/status/1",
+                    url="https://x.com/example_alice/status/1",
                     author="Alice (@alice)")
     cards, _ = build_topic_cards([mat], top_k=1, now=NOW, profile=PROFILE)
     card = cards[0]
@@ -267,7 +267,7 @@ def test_x_card_titles_are_paraphrased_and_never_contain_raw_post_or_handle():
 def test_step_write_topics_sanitizes_x_cards_on_any_write_path():
     raw = "这是一段超过二十个字的X帖子正文原文，包含用户名@alice以及不应入库的内容"
     mat = _material("x_posts:1", "x_posts", raw,
-                    url="https://x.com/alice/status/1",
+                    url="https://x.com/example_alice/status/1",
                     author="Alice (@alice)")
     cards, _ = build_topic_cards([mat], top_k=1, now=NOW, profile=PROFILE)
     cards[0]["拟定标题"] = raw

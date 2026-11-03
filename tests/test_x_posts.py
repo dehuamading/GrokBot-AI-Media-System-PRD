@@ -61,9 +61,9 @@ def test_load_x_posts_errors(tmp_path):
 def test_dedupe_x_posts_by_id_and_url(tmp_path):
     f = tmp_path / "dup.json"
     f.write_text(
-        '[{"id":"1","url":"https://x.com/a/status/1","text":"aa bb cc dd",'
+        '[{"id":"1","url":"https://x.com/example_a/status/1","text":"aa bb cc dd",'
         '"created_at":"2026-10-30T00:00:00Z","author_username":"a"},'
-        '{"id":"1","url":"https://x.com/a/status/1","text":"aa bb cc dd",'
+        '{"id":"1","url":"https://x.com/example_a/status/1","text":"aa bb cc dd",'
         '"created_at":"2026-10-30T00:00:00Z","author_username":"a"}]',
         encoding="utf-8")
     out, dropped = dedupe(load_x_posts(f))

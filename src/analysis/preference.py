@@ -17,10 +17,11 @@ from datetime import datetime, timezone
 from src.normalize import iso_now
 from src.notion_store.client import (date_prop, number_prop, rt, select_prop)
 
-VALID_PICKS = ("认可", "一般", "否决")
+VALID_PICKS = ("认可", "一般", "否决", "未选")
 STATUS_PENDING = "待验证"
 STATUS_CANDIDATE = "待确认"
 STATUS_ACTIVE = "正在使用"
+STATUS_MERGED = "已合并"
 
 
 def _text(page: dict, prop: str) -> str:
@@ -171,8 +172,14 @@ def _row_to_feedback(row: dict) -> dict:
 
 
 def load_recent_preferences(client, db_ids: dict, n_pos: int = 5,
-                            n_neg: int = 5) -> dict:
-    """读 05：最近 n_pos 条认可、n_neg 条否决（含原话）与正在使用规则。"""
+                            n_neg: int = 5, n_neutral: int = 5,
+                            n_unpicked: int = 5) -> dict:
+    """读 05：最近认可/否决/一般反馈、未选弱信号，以及全部正在使用规则。
+
+    - 类型=规则 且 状态=正在使用（含 RULE-T-001..005）全部注入；
+    - 类型=候选规则 且 状态=已合并 不注入（它不是用户确认的可执行规则）；
+    - 未选不写认可素材、不作为否决示例，只作为“未被选中（弱信号）”。
+    """
     rows = client.query_database(db_ids["05_经验与复盘"])
     feedbacks, rules, candidates = [], [], []
     for row in rows:
@@ -180,9 +187,9 @@ def load_recent_preferences(client, db_ids: dict, n_pos: int = 5,
         typ = rec["类型"]
         pick = rec["用户选择"]
         status = rec["状态"]
-        if typ in ("反馈", "复盘") and pick in ("认可", "否决"):
+        if typ in ("反馈", "复盘") and pick in ("认可", "否决", "一般", "未选"):
             feedbacks.append(rec)
-        if status == STATUS_ACTIVE and typ in ("规则", "候选规则"):
+        if status == STATUS_ACTIVE and typ == "规则":
             rules.append(rec)
         if typ == "候选规则" and status == STATUS_CANDIDATE:
             candidates.append(rec)
@@ -192,24 +199,31 @@ def load_recent_preferences(client, db_ids: dict, n_pos: int = 5,
                    reverse=True)
     approved = [f for f in feedbacks if f["用户选择"] == "认可"][:max(0, n_pos)]
     rejected = [f for f in feedbacks if f["用户选择"] == "否决"][:max(0, n_neg)]
+    neutral = [f for f in feedbacks if f["用户选择"] == "一般"][:max(0, n_neutral)]
+    unpicked = [f for f in feedbacks if f["用户选择"] == "未选"][:max(0, n_unpicked)]
     rules.sort(key=_feedback_time, reverse=True)
     candidates.sort(key=_feedback_time, reverse=True)
     return {
         "approved": approved,
         "rejected": rejected,
+        "neutral": neutral,
+        "unpicked": unpicked,
+        # 兼容调用方可能使用的别名（语义相同，只增不改）。
+        "weak": neutral,
+        "unselected": unpicked,
         "rules": rules,
         "candidate_rules": candidates,
     }
 
 
-def _fmt_feedback(items: list[dict]) -> list[str]:
+def _fmt_feedback(items: list[dict], prefix: str = "") -> list[str]:
     if not items:
         return ["（无）"]
     out = []
     for f in items:
         title = f.get("原始选题") or f.get("topic_id") or "未命名选题"
         reason = f.get("原话反馈") or f.get("原因标签") or "未填写原话"
-        out.append(f"- 选题：{title}；原话理由：{reason}")
+        out.append(f"- {prefix}选题：{title}；原话理由：{reason}")
     return out
 
 
@@ -217,6 +231,10 @@ def build_preference_prompt(prefs: dict) -> str:
     """把偏好整理为提示块；候选规则只作参考，明确不得作为硬规则。"""
     approved = _fmt_feedback(prefs.get("approved") or prefs.get("positive") or [])
     rejected = _fmt_feedback(prefs.get("rejected") or prefs.get("negative") or [])
+    neutral = _fmt_feedback(prefs.get("neutral") or prefs.get("weak") or [],
+                            prefix="（弱认可）")
+    unpicked = _fmt_feedback(prefs.get("unpicked") or prefs.get("unselected") or [],
+                             prefix="（未被选中，无理由，弱信号）")
     rules = [f"- {r.get('内容') or r.get('原始选题')}"
              for r in (prefs.get("rules") or prefs.get("active_rules") or [])]
     candidates = [f"- {r.get('内容') or r.get('原始选题')}"
@@ -224,10 +242,32 @@ def build_preference_prompt(prefs: dict) -> str:
     lines = [
         "【近期认可示例】", *approved,
         "【近期否决示例】", *rejected,
+        "【一般反馈（弱认可）】", *neutral,
+        "【未被选中（无理由，弱信号）】", *unpicked,
         "【正在使用规则】", *(rules or ["（无）"]),
         "【候选规则(待确认)】仅供参考不得作为硬规则", *(candidates or ["（无）"]),
     ]
     return "\n".join(lines)
+
+
+def load_feedback_for_topic(client, db_ids: dict, topic_id: str,
+                            limit: int = 10) -> list[dict]:
+    """读取某张选题卡在 05 的全部用户反馈原话（供 draft 提示注入）。"""
+    topic_id = str(topic_id or "").strip()
+    if not topic_id:
+        return []
+    rows = client.query_database(db_ids["05_经验与复盘"])
+    out = []
+    for row in rows:
+        rec = _row_to_feedback(row)
+        if rec.get("topic_id") != topic_id:
+            continue
+        if rec.get("类型") not in ("反馈", "复盘"):
+            continue
+        out.append(rec)
+    out.sort(key=lambda f: (_feedback_time(f), f.get("record_id") or ""),
+             reverse=True)
+    return out[:max(0, limit)]
 
 
 def _feedback_rounds(client, db_ids: dict) -> list[int]:

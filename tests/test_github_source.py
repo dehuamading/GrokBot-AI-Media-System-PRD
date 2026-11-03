@@ -148,14 +148,14 @@ def test_top_n_is_configurable(tmp_path, monkeypatch):
 
 
 def test_token_never_appears_in_errors_or_result(tmp_path, monkeypatch):
-    token = "ghp_SUPERSECRETVALUE123456789"
+    tokens = ["fake-token-value-not-real", "another-fake-value"]
     seen = []
     _install_fake(monkeypatch, fail_theme=True, token_holder=seen)
-    out = fetch_github(top=2, snapshots_path=tmp_path / "s.json", token=token)
+    out = fetch_github(top=2, snapshots_path=tmp_path / "s.json", token=tokens[0])
     blob = json.dumps(out, ensure_ascii=False)
-    assert token not in blob
+    assert tokens[0] not in blob
     assert out["errors"]
-    assert seen and all(a == f"Bearer {token}" for a in seen)
+    assert seen and all(a == f"Bearer {tokens[0]}" for a in seen)
 
 
 def test_unknown_paid_api_is_pending_not_invented(tmp_path, monkeypatch):

@@ -42,6 +42,7 @@ class Provider:
     api_key: str
     model: str
     extra_headers: dict[str, str] = field(default_factory=dict)
+    paid: bool = False
 
 
 def _env(name: str, default: str = "") -> str:
@@ -70,6 +71,7 @@ def load_providers(session_id: str) -> list[Provider]:
             api_base=_env("DEEPSEEK_API_BASE").rstrip("/"),
             api_key=_env("DEEPSEEK_API_KEY"),
             model=_env("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+            paid=True,
         ),
     ]
 
@@ -78,16 +80,30 @@ class ProviderChain:
     """多提供方回退链；一个实例代表一次运行（共享同一个 opencode session uuid）。"""
 
     def __init__(self, providers: list[Provider] | None = None,
-                 session_id: str | None = None, timeout: int = TIMEOUT):
+                 session_id: str | None = None, timeout: int = TIMEOUT,
+                 exclude_paid: bool = False,
+                 exclude_providers: set[str] | list[str] | None = None):
         self.session_id = session_id or str(uuid.uuid4())
-        self._providers = providers if providers is not None else load_providers(self.session_id)
+        loaded = providers if providers is not None else load_providers(self.session_id)
+        excluded = set(exclude_providers or ())
+        self.skipped: list[dict] = []
+        self._providers: list[Provider] = []
+        for p in loaded:
+            if p.name in excluded:
+                self.skipped.append({"provider": p.name,
+                                     "reason": "主动排除"})
+                continue
+            if exclude_paid and p.paid:
+                self.skipped.append({"provider": p.name,
+                                     "reason": "--no-paid 排除付费提供方"})
+                continue
+            self._providers.append(p)
         self._timeout = timeout
         # calls 兼容旧消费方 = 尝试次数（attempts）；successful_calls 只计成功。
         self.calls = 0
         self.successful_calls = 0
         self.usage_log: list[dict] = []
         self.attempts: list[dict] = []
-        self.skipped: list[dict] = []
         self._last_provider: str | None = None
         self._last_model: str | None = None
         for p in self._providers:

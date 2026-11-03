@@ -24,7 +24,8 @@ def _sel(*options: str):
 
 
 def _status_sel():
-    return _sel("待验证", "已验证", "正在使用", "需要复核", "已过时", "待确认")
+    return _sel("待验证", "已验证", "正在使用", "需要复核", "已过时", "待确认",
+                "已合并")
 
 
 DATABASE_SPECS: dict[str, tuple[str, dict]] = {
@@ -108,9 +109,9 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
     "04_文案与版本": ("✍️", {
         "draft_id": _title(),
         "topic_id": _rt(),
-        "platform": _sel("抖音", "小红书"),
+        "platform": _sel("抖音", "小红书", "两者"),
         "version": _num(),
-        "status": _sel("待生成", "V1", "修订中", "已确认"),
+        "status": _sel("待生成", "待审核", "V1", "修订中", "已确认"),
         "feedback_summary": _rt(),
         "change_summary": _rt(),
         "updated_at": _date(),
@@ -130,7 +131,7 @@ DATABASE_SPECS: dict[str, tuple[str, dict]] = {
         "topic_id": _rt(),
         "原始选题": _rt(),
         "推荐理由": _rt(),
-        "用户选择": _sel("认可", "一般", "否决"),
+        "用户选择": _sel("认可", "一般", "否决", "未选"),
         "原话反馈": _rt(),
         "原因标签": _rt(),
         "轮次": _num(),
@@ -204,7 +205,7 @@ DB_UPGRADES: dict[str, dict] = {
         "原始选题": {"rich_text": {}},
         "推荐理由": {"rich_text": {}},
         "用户选择": {"select": {"options": [{"name": o} for o in
-                                          ("认可", "一般", "否决")]}},
+                                          ("认可", "一般", "否决", "未选")]}},
         "原话反馈": {"rich_text": {}},
         "原因标签": {"rich_text": {}},
         "轮次": {"number": {"format": "number"}},
@@ -216,9 +217,14 @@ DB_UPGRADES: dict[str, dict] = {
 # 只增下拉选项升级（不删除既有选项，不改动已有行数据）
 DB_SELECT_OPTION_UPGRADES: dict[str, dict[str, list[str]]] = {
     "01_原始素材": {"source_type": ["x_posts", "github", "official", "import"]},
+    "04_文案与版本": {
+        "platform": ["两者"],
+        "status": ["待审核"],
+    },
     "05_经验与复盘": {
         "类型": ["认可素材", "反馈", "候选规则"],
-        "状态": ["待确认"],
+        "状态": ["待确认", "已合并"],
+        "用户选择": ["未选"],
     },
 }
 

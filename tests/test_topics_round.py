@@ -96,7 +96,7 @@ def _write_fixtures(tmp_path):
     x_posts = {"posts": [
         {
             "id": "mock-demand-post",
-            "url": "https://x.com/mock_user/status/1",
+            "url": "https://x.com/example_mock_user/status/1",
             "author_username": "mock_user",
             "author_name": "示例需求用户",
             "created_at": "2026-11-01T08:00:00.000Z",
@@ -106,7 +106,7 @@ def _write_fixtures(tmp_path):
         },
         {
             "id": "mock-side-post",
-            "url": "https://x.com/mock_side/status/2",
+            "url": "https://x.com/example_mock_side/status/2",
             "author_username": "mock_side",
             "author_name": "示例副业用户",
             "created_at": "2026-11-01T07:00:00.000Z",
@@ -210,7 +210,7 @@ def test_topics_round_end_to_end_mock_stops_at_gate1(tmp_path, capsys):
     cited_all = " ".join(FakeNotionClient.plain(r["properties"]["引用帖子"])
                          for r in rows)
     assert "example.com/newtech" in cited_all
-    assert "x.com/mock_side/status/2" in cited_all
+    assert "x.com/example_mock_side/status/2" in cited_all
 
     # 02_用户需求：只增、每类一行、计数=实际评论条数、证据脱敏
     demand_rows_02 = client.query_database(db_ids["02_用户需求"])
