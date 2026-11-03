@@ -507,6 +507,8 @@ def step_draft(client, db_ids, selections: list[dict], materials: list[dict],
     materials 为素材池快照，按 关联素材 的 item_id 匹配事实。
     红线：本步骤之后没有任何自动动作；DraftClient 只产文本，无发布能力。
     """
+    from src.llm.draft_writer import finalize_draft
+
     mat_by_id = {m["item_id"]: m for m in materials}
     drafts_meta = []
     for card in selections:
@@ -515,7 +517,9 @@ def step_draft(client, db_ids, selections: list[dict], materials: list[dict],
             missing = set(card["关联素材"]) - set(mat_by_id)
             print(f"⚠️ {card['topic_id']} 有关联素材不在本地快照：{missing}（初稿事实清单会相应缺失）")
         for platform in card.get("platforms") or platforms_of(card):
-            draft = llm.generate(platform, card, rel_mats)
+            # 旧 --draft 路径与 cmd_draft 共用同一安全清洗/结构补齐管道。
+            draft = finalize_draft(llm.generate(platform, card, rel_mats),
+                                   card, rel_mats, platform=platform)
             draft.draft_id = f"D-{card['topic_id']}-{platform}-v{draft.version}"
             page_id, created = write_draft_row(client, db_ids, draft, card["topic_id"])
             drafts_meta.append({"draft_id": draft.draft_id, "topic_id": card["topic_id"],

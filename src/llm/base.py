@@ -20,6 +20,7 @@ class Draft:
     unverified_warnings: list[str] = field(default_factory=list)
     engine: str = "template@v1"
     version: int = 1              # PRD 6.1：每题×每平台只有 V1 起点一份，之后修订同一稿
+    draft_id: str = ""            # D-<topic_id>-<platform>-v<version>；写 04 的唯一键
     titles: list[str] = field(default_factory=list)
     openings: list[str] = field(default_factory=list)
     demo_suggestions: list[str] = field(default_factory=list)

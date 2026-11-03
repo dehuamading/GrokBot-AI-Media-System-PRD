@@ -404,8 +404,9 @@ def _single_draft_platform(card: dict) -> str:
 def cmd_draft(args, client=None, chat=None) -> int:
     """阶段4：按 --topic 读取 03 全字段 + 05 规则/反馈 → 写 04 → 停 GATE-2。"""
     from src.analysis import preference
-    from src.llm.draft_writer import (DraftWriter, build_draft_injection,
-                                      finalize_draft, render_markdown)
+    from src.llm.draft_writer import (FALLBACK_MARK, DraftWriter,
+                                      build_draft_injection, finalize_draft,
+                                      render_markdown)
     from src.notion_store.gates import (read_topic_cards_by_ids,
                                         write_draft_row_pending)
 
@@ -416,7 +417,11 @@ def cmd_draft(args, client=None, chat=None) -> int:
 
     topic_ids = _expand_topic_args(getattr(args, "topic", None))
     if topic_ids:
-        cards = read_topic_cards_by_ids(client, db_ids, topic_ids)
+        try:
+            cards = read_topic_cards_by_ids(client, db_ids, topic_ids)
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            return 1
         missing = [tid for tid in topic_ids if tid not in
                    {c.get("topic_id") for c in cards}]
         if missing:
@@ -424,11 +429,6 @@ def cmd_draft(args, client=None, chat=None) -> int:
         if not cards:
             print("⏸ GATE-1：未找到可写选题卡，未生成任何文案。")
             return 1
-        unselected = [c.get("topic_id") for c in cards
-                      if c.get("用户选择结果") != "已选定"]
-        if unselected:
-            print(f"⚠️ 显式 --topic 指定了未标记已选定的卡：{unselected}"
-                  "（按用户手动指定继续；仍停在 GATE-2，不会发布）")
     else:
         cards = pipeline.step_gate1(client, db_ids)
         if not cards:
@@ -461,7 +461,11 @@ def cmd_draft(args, client=None, chat=None) -> int:
     openai_client = None
     if llm_name == "openai-compat" and chat is None:
         from src.llm.openai_compat import OpenAICompatClient
-        openai_client = OpenAICompatClient()
+        try:
+            openai_client = OpenAICompatClient()
+        except Exception as exc:  # noqa: BLE001 - 配置缺失时回退离线模板
+            print(f"⚠️ openai-compat 初始化失败，回退模板："
+                  f"{type(exc).__name__}: {exc}")
 
     export_dir = getattr(args, "export_dir", None)
     if export_dir:
@@ -487,9 +491,18 @@ def cmd_draft(args, client=None, chat=None) -> int:
         platform = _single_draft_platform(card)
         if openai_client is not None:
             target = "抖音" if platform == "两者" else platform
-            raw = openai_client.generate(target, card, rel_mats)
-            raw.platform = platform
-            draft = finalize_draft(raw, card, rel_mats, platform=platform)
+            try:
+                raw = openai_client.generate(target, card, rel_mats,
+                                             injection_text=injection)
+                raw.platform = platform
+                draft = finalize_draft(raw, card, rel_mats, platform=platform)
+            except Exception as exc:  # noqa: BLE001 - 任何失败都回退模板
+                print(f"⚠️ openai-compat 生成失败，回退模板："
+                      f"{type(exc).__name__}: {exc}")
+                draft = DraftWriter(chat=None, fallback=TemplateClient(),
+                                    injection_text=injection).generate(
+                                        platform, card, rel_mats)
+                draft.engine = f"{draft.engine}（{FALLBACK_MARK}）"
         else:
             writer = DraftWriter(chat=chat, fallback=TemplateClient(),
                                  injection_text=injection)
@@ -516,7 +529,8 @@ def cmd_draft(args, client=None, chat=None) -> int:
         state.update(stage="waiting_gate2")
     state.save()
 
-    _log_draft_cost(args, chat, results)
+    _log_draft_cost(args, openai_client if openai_client is not None else chat,
+                    results)
     print("⏸ GATE-2：等待用户审核，未发布。")
     print("ℹ️ 系统无发布能力；请在 Notion「04_文案与版本」人工审阅，"
           "状态改 已确认 或 修订中（附反馈）。")

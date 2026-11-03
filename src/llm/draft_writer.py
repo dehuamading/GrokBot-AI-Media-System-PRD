@@ -91,11 +91,18 @@ def build_draft_injection(card: dict, prefs: dict | None = None,
 
 
 def _split_urls(value) -> list[str]:
+    """按中英文逗号/顿号/分号/空白拆分；list 元素也做二次拆分。"""
     if isinstance(value, (list, tuple)):
         raw = [str(v) for v in value]
     else:
-        raw = re.split(r"[；;,\s]+", str(value or ""))
-    return [u for u in raw if u.startswith(("http://", "https://"))]
+        raw = [str(value or "")]
+    out: list[str] = []
+    for chunk in raw:
+        for url in re.split(r"[，,、；;\s]+", chunk):
+            url = url.strip()
+            if url.startswith(("http://", "https://")):
+                out.append(url)
+    return out
 
 
 def collect_sources(card: dict, materials: list[dict]) -> list[str]:
@@ -279,14 +286,18 @@ def _draft_from_data(data: dict, card: dict, platform: str, chat) -> Draft:
         elif str(item).strip():
             checklist.append(str(item))
     sources = [str(s) for s in (data.get("sources") or []) if str(s).strip()]
+    topic_id = card.get("topic_id") or ""
+    version = 1
     return Draft(
-        topic_id=card.get("topic_id") or "",
+        topic_id=topic_id,
         platform=platform,
         title=titles[0] if titles else (card.get("拟定标题") or "待审核文案"),
         body=str(script),
         fact_checklist=checklist,
         sources=sources,
         engine=_service_label(chat),
+        version=version,
+        draft_id=f"D-{topic_id}-{platform}-v{version}",
         titles=titles,
         openings=[str(o) for o in openings if str(o).strip()],
         demo_suggestions=[str(d) for d in demo if str(d).strip()],
@@ -321,12 +332,14 @@ def finalize_draft(draft: Draft, card: dict, materials: list[dict], *,
     while len(titles) < 3:
         titles.append(safe(f"{base_title}｜看点{len(titles) + 1}"))
     titles = [t for t in titles if t][:3]
+    while len(titles) < 3:
+        titles.append(safe(f"{base_title}｜看点{len(titles) + 1}"))
     raw_openings = [safe(o) for o in (draft.openings or [])]
     openings = _opening_variants(card, [o for o in raw_openings if o])
     openings = [safe(o) for o in openings if safe(o)]
     while len(openings) < 2:
-        openings.append(safe("这条只回答一个问题：它能做什么、适合谁，"
-                             "以及为什么值得关注。"))
+        openings.append(safe(
+            f"这条只回答一个问题：它能做什么、适合谁（{len(openings) + 1}）。"))
     openings = [o for o in openings if o][:2]
     body = safe(draft.body)
     safe_card = {k: safe(v) for k, v in card.items()
@@ -373,9 +386,16 @@ def finalize_draft(draft: Draft, card: dict, materials: list[dict], *,
     if not sources:
         warnings.append("本选题缺少可打开的原始出处链接，发布前必须补证。")
 
+    resolved_platform = platform or draft.platform
+    version = draft.version or 1
+    draft_id = (draft.draft_id or
+                f"D-{draft.topic_id or card.get('topic_id')}-"
+                f"{resolved_platform}-v{version}")
     return replace(
         draft,
-        platform=platform or draft.platform,
+        platform=resolved_platform,
+        version=version,
+        draft_id=draft_id,
         title=titles[0],
         body=body,
         titles=titles[:3],
@@ -398,7 +418,9 @@ class DraftWriter(DraftClient):
 
     def generate(self, platform: str, card: dict, materials: list[dict]) -> Draft:
         if self.chat is None:
-            return self._fallback(platform, card, materials)
+            # 无 LLM 时的模板回退也必须走统一清洗/补齐，不能绕过安全约束。
+            return finalize_draft(self._fallback(platform, card, materials),
+                                  card, materials, platform=platform)
 
         user = "\n\n".join([
             f"平台：{platform}",

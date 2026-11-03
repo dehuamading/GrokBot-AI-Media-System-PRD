@@ -196,10 +196,14 @@ def _side_hustle(item: dict, text: str) -> tuple[int, str, str]:
 
 
 _OVERSEAS_SIGNALS = ("国外", "海外", "境外", "外国", "global", "overseas")
-_RESTRICTED_SIGNALS = ("国内暂不可用", "国内不可用", "暂不可用", "无法访问",
-                       "被墙", "封禁", "不支持国内", "需要梯子", "需梯子",
-                       "翻墙", "科学上网", "外币卡", "国外信用卡", "境外卡",
-                       "需要订阅", "需付费", "付费订阅", "受限")
+# 硬不可用：非国外新品的“不可用”应判 0，不能被“可用”子串反转成 2。
+_HARD_UNAVAILABLE_SIGNALS = ("不可用", "无法访问", "被墙", "封禁",
+                             "不支持国内")
+# 软受限：需梯子/外币卡/付费等，非硬不可用时维持 1 分。
+_SOFT_RESTRICTED_SIGNALS = ("需要梯子", "需梯子", "翻墙", "科学上网",
+                            "外币卡", "国外信用卡", "境外卡", "需要订阅",
+                            "需付费", "付费订阅", "受限")
+_RESTRICTED_SIGNALS = _HARD_UNAVAILABLE_SIGNALS + _SOFT_RESTRICTED_SIGNALS
 _NEW_TOOL_SIGNALS = ("新工具", "新模型", "新功能", "新能力", "刚出",
                      "刚发布", "首次", "首个", "发布", "上线", "突破",
                      "降低门槛")
@@ -207,7 +211,11 @@ OVERSEAS_OPPORTUNITY_LABEL = "国外新机会（国内暂不可用，只讲能�
 
 
 def _overseas_new_tool(item: dict, text: str) -> bool:
-    """识别“国外刚出、国内暂不可用”的新工具机会（规则2）。"""
+    """识别“国外刚出、国内暂不可用”的新工具机会（规则2）。
+
+    国外信号（flag / 明示国外）与新品信号必须同时成立；
+    纯国内的“需付费/订阅/受限”不得贴“国外新机会”标签。
+    """
     explicit = str(item.get("china_usability") or item.get("国内可用性")
                    or (item.get("extra") or {}).get("china_usability") or "")
     extra = item.get("extra") or {}
@@ -216,24 +224,30 @@ def _overseas_new_tool(item: dict, text: str) -> bool:
         extra.get(k) is True for k in ("overseas", "is_overseas",
                                       "overseas_new", "foreign"))
     blob = (explicit + " " + str(text or "")).lower()
-    overseas = flagged or any(k.lower() in blob for k in _OVERSEAS_SIGNALS)
+    # 必须有明确的国外信号；单凭“不可用/需付费”不能推断为国外新品，
+    # 否则纯国内新工具的“不可用”会被反转成国外机会。
+    overseas = (flagged
+                or any(k.lower() in blob for k in _OVERSEAS_SIGNALS))
     new_tool = any(k.lower() in blob for k in _NEW_TOOL_SIGNALS)
-    restricted = any(k.lower() in blob for k in _RESTRICTED_SIGNALS)
-    return bool((overseas and (new_tool or restricted))
-                or (restricted and new_tool))
+    return bool(new_tool and overseas)
 
 
 def _china_usability(item: dict, text: str) -> tuple[int, str, bool, bool]:
-    """国内适用性：可用 2 / 国外新机会、需梯子或外币卡 1 / 待验证 0。
+    """国内适用性：可用 2 / 国外新机会或软受限 1 / 不可用、待验证 0。
 
     规则2：国外刚出、国内暂不可用的新工具也是重点机会。此时该维给中性
     1 分（不是 0），并在理由中明确“只讲能力不讲开通”；新技术机会维度照常计分。
+    非国外新品的硬“不可用”必须判 0；受限信号先于“可用”子串判断。
     """
     explicit = (item.get("china_usability") or item.get("国内可用性")
                 or (item.get("extra") or {}).get("china_usability") or "")
     explicit = str(explicit).strip()
-    explicit_blob = (explicit + " " + str(text or "")).lower()
-    explicit_restricted = any(k.lower() in explicit_blob
+    explicit_l = explicit.lower()
+    text_l = str(text or "").lower()
+    # 显式字段优先：正文关键词不得把显式“可用”降档（反之亦然）。
+    explicit_hard = any(k.lower() in explicit_l
+                        for k in _HARD_UNAVAILABLE_SIGNALS)
+    explicit_restricted = any(k.lower() in explicit_l
                               for k in _RESTRICTED_SIGNALS)
     explicit_positive = any(k in explicit for k in ("可用", "能用")) and \
         not explicit_restricted
@@ -241,21 +255,32 @@ def _china_usability(item: dict, text: str) -> tuple[int, str, bool, bool]:
     if explicit:
         if any(k in explicit for k in ("待验证", "未知", "不确定")):
             return 0, f"素材标注：{explicit}（待验证）", True, False
-        if explicit_positive:
-            return 2, f"素材标注：{explicit}", False, False
         if explicit_restricted:
             overseas = _overseas_new_tool(item, text)
+            if explicit_hard:
+                if overseas:
+                    return 1, OVERSEAS_OPPORTUNITY_LABEL, False, True
+                return (0, f"素材标注：{explicit}（国内不可用）",
+                        False, False)
             reason = (OVERSEAS_OPPORTUNITY_LABEL if overseas else
                       f"素材标注：{explicit}（国内暂不可用，只讲能力不讲开通）")
             return 1, reason, False, overseas
+        if explicit_positive:
+            return 2, f"素材标注：{explicit}", False, False
 
     # 疑问句不是可用性证据，必须在“可用”等肯定字样之前判定。
     if any(k in text for k in ("吗", "？", "?", "么")):
         return 0, "待验证：文本是询问而非可用性证据", True, False
+    # 硬不可用优先于“可用”子串（“不可用”本身包含“可用”）。
+    if any(k.lower() in text_l for k in _HARD_UNAVAILABLE_SIGNALS):
+        overseas = _overseas_new_tool(item, text)
+        if overseas:
+            return 1, OVERSEAS_OPPORTUNITY_LABEL, False, True
+        return 0, "文本提示国内不可用", False, False
     if any(k in text for k in ("国内可用", "国内能用", "不用翻墙", "免翻墙",
                                "无需翻墙", "直接可用", "支持国内", "国内直接")):
         return 2, "文本提示国内可直接使用", False, False
-    if any(k in text for k in _RESTRICTED_SIGNALS):
+    if any(k.lower() in text_l for k in _SOFT_RESTRICTED_SIGNALS):
         overseas = _overseas_new_tool(item, text)
         reason = (OVERSEAS_OPPORTUNITY_LABEL if overseas else
                   "文本提示国内暂不可用（只讲能力不讲开通）")

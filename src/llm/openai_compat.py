@@ -38,13 +38,22 @@ class OpenAICompatClient(DraftClient):
             raise LLMNotConfigured(
                 "openai-compat 引擎未配置：需同时设置 LLM_API_BASE / LLM_API_KEY / LLM_MODEL"
                 "（默认使用离线模板引擎 template，无需任何服务）")
+        # 与 ProviderChain 对齐：成本日志需要真实调用次数与 usage。
+        self.calls = 0
+        self.successful_calls = 0
+        self.usage_log: list[dict] = []
+        self.last_provider = "openai-compat"
+        self.last_model = self._model
 
-    def generate(self, platform: str, card: dict, materials: list[dict]) -> Draft:
+    def generate(self, platform: str, card: dict, materials: list[dict],
+                 injection_text: str = "") -> Draft:
         user_msg = json.dumps({
             "平台": platform, "选题卡": card,
             "素材事实": [{"事实": c, "出处": m.get("source_url")}
                       for m in materials for c in (m.get("claims") or [])],
+            "注入规则与反馈": injection_text,
         }, ensure_ascii=False)
+        self.calls += 1
         resp = requests.post(
             f"{self._base}/chat/completions",
             headers={"Authorization": f"Bearer {self._key}",
@@ -59,7 +68,19 @@ class OpenAICompatClient(DraftClient):
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        payload = resp.json()
+        usage = payload.get("usage") or {}
+        self.usage_log.append({
+            "provider": "openai-compat",
+            "model": self._model,
+            "prompt_tokens": usage.get("prompt_tokens", "未知"),
+            "completion_tokens": usage.get("completion_tokens", "未知"),
+            "cost": usage.get("cost", "未知"),
+            "cost_basis": ("接口返回" if usage.get("cost") is not None
+                           else "未知"),
+        })
+        self.successful_calls += 1
+        content = payload["choices"][0]["message"]["content"]
         data = json.loads(content)
         return Draft(topic_id=card["topic_id"], platform=platform,
                      title=data["title"], body=data["body"],

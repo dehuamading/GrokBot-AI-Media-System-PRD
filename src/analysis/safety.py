@@ -14,9 +14,11 @@ import re
 
 # (展示名, 正则)；英文大小写不敏感。
 _FORBIDDEN_STEP_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("注册", re.compile(r"注册(?:账号|帐号|账户)?", re.I)),
+    # 只命中步骤性表述（注册账号/先注册/去注册），避免误删“注册用户”等正文。
+    ("注册", re.compile(r"(?:先|去)注册(?:账号|帐号|账户)?|注册(?:账号|帐号|账户)", re.I)),
     ("翻墙", re.compile(r"翻墙", re.I)),
-    ("VPN", re.compile(r"\bVPN\b|vpn", re.I)),
+    # 用 ASCII 字母数字边界，既避免 openvpn 误命中，也兼容“用VPN访问”这类中文邻接。
+    ("VPN", re.compile(r"(?<![A-Za-z0-9])vpn(?![A-Za-z0-9])", re.I)),
     ("梯子", re.compile(r"梯子|科学上网", re.I)),
     ("代充", re.compile(r"代充", re.I)),
     ("虚拟卡", re.compile(r"虚拟卡", re.I)),

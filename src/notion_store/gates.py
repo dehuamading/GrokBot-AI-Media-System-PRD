@@ -53,7 +53,8 @@ def _card_from_row(r: dict) -> dict:
     linked = [x for x in linked_text.replace(" ", "").split("、") if x]
     source = (all_fields.get("原始来源") or _cell(r, "原始来源")
               or all_fields.get("引用帖子") or "")
-    sources = [s for s in re.split(r"[；;\s]+", str(source)) if s]
+    # 与 draft_writer._split_urls 一致：中文逗号/顿号/分号/空白均可分隔。
+    sources = [s for s in re.split(r"[，,、；;\s]+", str(source)) if s]
     card = dict(all_fields)
     card.update({
         "topic_id": topic_id, "row_id": r["id"], "platform": platform,
@@ -77,8 +78,13 @@ def read_gate1_selections(client: NotionClient, db_ids: dict[str, str]) -> list[
 
 
 def read_topic_cards_by_ids(client: NotionClient, db_ids: dict[str, str],
-                            topic_ids: list[str]) -> list[dict]:
-    """按 topic_id 读取 03 完整卡片（draft --topic 显式指定时使用）。"""
+                            topic_ids: list[str], *,
+                            require_selected: bool = True) -> list[dict]:
+    """按 topic_id 读取 03 完整卡片（draft --topic 显式指定时使用）。
+
+    GATE-1 语义：默认只允许「用户选择结果=已选定」的卡进入写稿；
+    显式指定未选定的卡必须拒绝并提示，而不是静默写 04。
+    """
     wanted = {str(t).strip() for t in topic_ids if str(t).strip()}
     order = [str(t).strip() for t in topic_ids if str(t).strip()]
     found: dict[str, dict] = {}
@@ -86,7 +92,15 @@ def read_topic_cards_by_ids(client: NotionClient, db_ids: dict[str, str],
         card = _card_from_row(row)
         if card.get("topic_id") in wanted:
             found[card["topic_id"]] = card
-    return [found[tid] for tid in order if tid in found]
+    cards = [found[tid] for tid in order if tid in found]
+    if require_selected:
+        unselected = [c.get("topic_id") for c in cards
+                      if c.get("用户选择结果") != "已选定"]
+        if unselected:
+            raise ValueError(
+                f"GATE-1：以下选题卡未选定，拒绝写稿：{unselected}；"
+                "请先在 03_选题决策 将「用户选择结果」改为 已选定。")
+    return cards
 
 
 def validate_gate1(selections: list[dict]) -> None:
