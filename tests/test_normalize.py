@@ -10,7 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.normalize import (dedupe, make_item_id, normalize_aihot_item,
-                           normalize_url, normalize_x_account, screen_score,
+                           normalize_github_item, normalize_url,
+                           normalize_x_account, normalize_x_reply, screen_score,
                            validate_item)
 
 
@@ -83,6 +84,60 @@ def test_screen_score_explainable():
     assert 0 <= score <= 10
     assert any("教程" in r or "类目" in r for r in reasons)
     assert screen_score({"title_or_summary": "xx", "claims": [], "extra": {}}) == (0, [])
+
+
+# ---------------------------------------------------------------- 修复轮回归
+def test_normalize_x_reply_ignores_list_and_dict_metrics():
+    reply = normalize_x_reply({
+        "text": "求教程（假数据）",
+        "likes": [{"id": "not-a-count"}],
+        "reposts": {"count": 2},
+        "replies": ["not-a-count"],
+        "quotes": None,
+        "public_metrics": {"like_count": 7, "retweet_count": 8,
+                           "reply_count": 9, "quote_count": 10},
+    })
+    assert reply["metrics"] == {"likes": 7, "reposts": 8,
+                                "replies": 9, "quotes": 10}
+
+
+def test_normalize_x_reply_reads_referenced_tweets_parent():
+    reply = normalize_x_reply({
+        "text": "回复（假数据）",
+        "referenced_tweets": [{"type": "replied_to", "id": "p-9"}],
+    })
+    assert reply["parent_id"] == "p-9"
+
+
+def test_x_source_url_exemption_requires_explicit_missing_url_error():
+    it = normalize_aihot_item(_sample_aihot_raw())
+    it.update(source_type="x_posts", platform="x", source_url="",
+              errors=["其他错误"])
+    assert any("source_url" in e for e in validate_item(it))
+    it["errors"] = ["缺少 url（未拼接 x.com 链接）"]
+    assert not any("source_url" in e for e in validate_item(it))
+
+
+def test_normalize_github_item_is_self_reported_with_license_status():
+    raw = {
+        "full_name": "example-org/demo",
+        "name": "demo",
+        "owner": {"login": "example-org"},
+        "html_url": "https://github.com/example-org/demo",
+        "description": "维护者自述（假数据）",
+        "stargazers_count": 10,
+        "pushed_at": "2026-10-30T00:00:00Z",
+        "license": {"spdx_id": "MIT", "name": "MIT License"},
+        "topics": ["ai"],
+    }
+    it = normalize_github_item(raw)
+    assert it["evidence_status"] == "self_reported"
+    assert it["extra"]["github"]["metadata_verified"] is True
+    assert it["license_status"] == "公开+许可证:MIT"
+
+    raw["license"] = {}
+    unknown = normalize_github_item(raw)
+    assert unknown["license_status"] == "公开+许可证:未知"
 
 
 # ---------------------------------------------------------------- 选题卡校验（PRD 5.4）

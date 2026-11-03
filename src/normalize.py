@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -32,6 +33,10 @@ VALID_SOURCE_TYPES = {
     "github_domestic",
     "feishu_domestic",
     "manual",
+    # 阶段2-B 新增（只增不改）
+    "github",
+    "official",
+    "import",
 }
 
 VALID_EVIDENCE_STATUS = {"verified", "self_reported", "third_party", "unverified"}
@@ -111,12 +116,131 @@ def normalize_aihot_item(raw: dict) -> dict:
         "tool_or_method": [],
         "duplicate_of": None,
         "processing_status": "new",
+        # 阶段2-B 统一字段（只增不改旧字段）
+        "platform": "aihot",
+        "origin_agent": "pi",
+        "keywords": [],
+        "comments": [],
+        "metrics": {},
+        "license_status": "公开",
+        "errors": [],
         "extra": {
             "category": raw.get("category"),
             "aihot_score": raw.get("score"),
             "reason": raw.get("reason") or "",
             "aihot_url": links.get("aihot", ""),
         },
+    }
+
+
+def normalize_github_item(raw: dict, github_extra: dict | None = None) -> dict:
+    """把 GitHub REST search/repositories 条目映射为统一素材（只读取公开元数据）。"""
+    full_name = raw.get("full_name") or raw.get("name") or str(raw.get("id") or "")
+    owner = (raw.get("owner") or {}).get("login") or full_name.split("/")[0]
+    description = (raw.get("description") or "").strip()
+    stars = raw.get("stargazers_count")
+    if not isinstance(stars, (int, float)):
+        stars = 0
+    topics = [str(t) for t in (raw.get("topics") or []) if t]
+    license_raw = raw.get("license") or {}
+    license_name = (license_raw.get("spdx_id") or license_raw.get("name")
+                    or "未标注")
+    spdx = str(license_raw.get("spdx_id") or "").strip()
+    license_label = spdx if spdx and spdx.upper() not in {
+        "NOASSERTION", "NONE"} else "未知"
+    html_url = raw.get("html_url") or ""
+    pushed = raw.get("pushed_at") or raw.get("updated_at") or None
+
+    github = {
+        "name": raw.get("name") or full_name,
+        "full_name": full_name,
+        "url": html_url,
+        "purpose": description or "待验证",
+        "stars": stars,
+        "last_update": pushed,
+        "latest_release": "无",
+        "license": license_name,
+        "install_difficulty": "待验证（推测）",
+        "needs_paid_api": "待验证",
+        "windows_support": "待验证",
+        "china_usability": "待验证",
+        "target_users": [],
+        "worth_video": "待验证（推测）",
+        "language": raw.get("language"),
+        # 仓库元数据来自官方 REST，可信；description 仍是维护者自述。
+        "metadata_verified": True,
+    }
+    if github_extra:
+        github.update(github_extra)
+
+    return {
+        "item_id": make_item_id("github", full_name or str(raw.get("id") or "")),
+        "source_type": "github",
+        "source_url": html_url,
+        "author_or_publisher": str(owner),
+        "published_at": pushed,
+        "collected_at": iso_now(),
+        "title_or_summary": f"{full_name}：{description}" if description else full_name,
+        "raw_reference": f"GitHub 官方 REST：{full_name}",
+        "claims": [description] if description else [],
+        "evidence_status": "self_reported",
+        "target_user_hypotheses": list(github.get("target_users") or []),
+        "user_problem_evidence": [],
+        "tool_or_method": topics,
+        "duplicate_of": None,
+        "processing_status": "new",
+        "platform": "github",
+        "origin_agent": "pi",
+        "keywords": topics,
+        "comments": [],
+        "metrics": {"stars": stars},
+        "license_status": f"公开+许可证:{license_label}",
+        "errors": [],
+        "extra": {"github": github},
+    }
+
+
+def normalize_official_item(raw: dict, source: dict) -> dict:
+    """把官方 RSS/Atom/Releases 条目映射为统一素材。
+
+    raw 由 official_source 解析成统一中间结构：id/url/title/summary/published_at。
+    """
+    url = (raw.get("url") or "").strip()
+    title = (raw.get("title") or "").strip()
+    summary = (raw.get("summary") or "").strip()
+    key = raw.get("id") or hashlib.sha1(
+        f"{source.get('id', '')}|{url}|{title}".encode("utf-8")).hexdigest()[:16]
+    source_name = source.get("name") or source.get("id") or "官方源"
+    extra_official = {
+        "source_id": source.get("id"),
+        "source_name": source_name,
+        "source_type": source.get("type"),
+    }
+    extra_official.update(raw.get("extra") or {})
+    return {
+        "item_id": make_item_id("official", str(key)),
+        "source_type": "official",
+        "source_url": url,
+        "author_or_publisher": source_name,
+        "published_at": raw.get("published_at") or None,
+        "collected_at": iso_now(),
+        "title_or_summary": f"{title} {summary}".strip()[:800],
+        "raw_reference": f"官方源：{source_name}",
+        "claims": [summary] if summary else ([title] if title else []),
+        "evidence_status": "verified",
+        "target_user_hypotheses": [],
+        "user_problem_evidence": [],
+        "tool_or_method": [],
+        "duplicate_of": None,
+        "processing_status": "new",
+        "platform": "official",
+        "origin_agent": "pi",
+        "keywords": [],
+        "comments": [],
+        "metrics": {},
+        "license_status": "公开",
+        "errors": [],
+        "extra": {"official": extra_official},
     }
 
 
@@ -139,24 +263,89 @@ def normalize_x_account(raw: dict) -> dict:
     }
 
 
-def normalize_x_post(raw: dict) -> dict:
-    """把 X 帖子文件的单条记录（任务05：inputs/x_posts_24h.json，本地 JSON，不访问 X）
-    映射为统一素材格式。
+def normalize_x_post(raw: dict, users: dict | None = None) -> dict:
+    """把 X 帖子文件的单条记录映射为统一素材格式。
 
-    字段：id,url,author_username,author_name,created_at,text,lang,likes,
-    reposts,replies,quotes,impressions,links。
-    - source_url 必须原样使用文件里的 url（任务05 硬约束，不做规范化改写）；
+    兼容两种输入（任务 A2）：
+    1) 扁平格式：id,url,author_username,author_name,created_at,text,lang,likes,
+       reposts,replies,quotes,impressions,links；
+    2) X API 原样格式：data[] 条目（author_id + public_metrics + conversation_id），
+       作者由 users（includes.users 的 id→user 映射）补全。
+
+    - source_url 原样使用文件里的 url；缺失时若 username 与 id 齐备，则构造
+      x.com 可追溯链接并在 extra 标注 url_constructed=true，否则留空记入 errors；
     - 证据等级 self_reported：帖子是作者自述，未交叉核验；
-    - 互动数据放 extra，供预筛与选题卡「需求信号」参考。
+    - 互动数据同时保留在 extra（兼容旧消费方）与 metrics（新统一字段）。
     """
     text = (raw.get("text") or "").strip()
-    username = raw.get("author_username") or ""
-    author = f"{raw.get('author_name') or ''} (@{username})".strip()
+    username = str(raw.get("author_username") or "")
+    author_name = str(raw.get("author_name") or "")
+    author_id = str(raw.get("author_id") or "")
+    if author_id and users:
+        user = users.get(author_id)
+        if isinstance(user, dict):
+            username = username or str(user.get("username") or "")
+            author_name = author_name or str(user.get("name") or "")
+    if username or author_name:
+        author = f"{author_name} (@{username})".strip()
+    elif author_id:
+        author = f"@{author_id}"
+    else:
+        author = ""
+
+    api_metrics = raw.get("public_metrics") if isinstance(
+        raw.get("public_metrics"), dict) else {}
+
+    def metric(flat_key: str, api_key: str):
+        value = raw.get(flat_key)
+        if isinstance(value, (list, dict)):
+            value = None  # 例如 replies 为回复数组而非计数
+        if value is None:
+            value = api_metrics.get(api_key)
+        return 0 if value is None else value
+
+    likes = metric("likes", "like_count")
+    reposts = metric("reposts", "retweet_count")
+    reply_count = metric("replies", "reply_count")
+    quotes = metric("quotes", "quote_count")
+    impressions = metric("impressions", "impression_count")
+
+    replies_raw = raw.get("replies")
+    comments = normalize_x_replies(replies_raw) if isinstance(replies_raw, list) else []
+
     links = [x for x in (raw.get("links") or []) if x]
+    entities = raw.get("entities") if isinstance(raw.get("entities"), dict) else {}
+    for link in entities.get("urls") or []:
+        if isinstance(link, dict):
+            url = link.get("expanded_url") or link.get("url")
+            if url and url not in links:
+                links.append(url)
+
+    keywords = raw.get("keywords")
+    if isinstance(keywords, list):
+        keywords = [str(k) for k in keywords if k]
+    else:
+        keywords = [str(h.get("tag")) for h in (entities.get("hashtags") or [])
+                    if isinstance(h, dict) and h.get("tag")]
+
+    source_url = raw.get("url") or raw.get("source_url") or ""
+    url_constructed = False
+    if not source_url and username and raw.get("id"):
+        # X API 原样格式无 url，但 username 与 id 齐备时可稳定构造可追溯链接。
+        # x.com 仅用于拼接本地素材的可追溯链接，不是网络访问端点。
+        source_url = urlunsplit(("https", "x.com",
+                                 f"/{username}/status/{raw['id']}", "", ""))
+        url_constructed = True
+    errors = list(raw.get("errors")) if isinstance(raw.get("errors"), list) else []
+    if not source_url:
+        errors.append("缺少 url（无法用 username+id 构造）")
+    if not author:
+        errors.append("缺少作者信息")
+
     return {
         "item_id": make_item_id("x_posts", str(raw.get("id") or "")),
         "source_type": "x_posts",
-        "source_url": raw.get("url") or "",  # 原样使用，不规范化
+        "source_url": source_url,  # 原样使用；缺失则留空（不规范化改写）
         "author_or_publisher": author,
         "published_at": raw.get("created_at") or None,
         "collected_at": iso_now(),
@@ -165,21 +354,94 @@ def normalize_x_post(raw: dict) -> dict:
         "claims": [text[:2000]] if text else [],
         "evidence_status": "self_reported",
         "target_user_hypotheses": [],
-        "user_problem_evidence": [],
+        "user_problem_evidence": [c["text"] for c in comments if c.get("text")][:5],
         "tool_or_method": [],
         "duplicate_of": None,
         "processing_status": "new",
+        # 任务 A2 新增统一字段（只增不改旧字段）
+        "platform": "x",
+        "origin_agent": "grokbot",
+        "metrics": {"likes": likes, "reposts": reposts, "replies": reply_count,
+                    "quotes": quotes, "views": impressions},
+        "comments": comments,
+        "keywords": keywords,
+        "license_status": "公开",
+        "errors": errors,
         "extra": {
             "author_username": username,
+            "author_id": author_id,
+            "conversation_id": raw.get("conversation_id") or "",
             "lang": raw.get("lang"),
-            "likes": raw.get("likes") or 0,
-            "reposts": raw.get("reposts") or 0,
-            "replies": raw.get("replies") or 0,
-            "quotes": raw.get("quotes") or 0,
-            "impressions": raw.get("impressions") or 0,
+            "likes": likes,
+            "reposts": reposts,
+            "replies": reply_count,
+            "quotes": quotes,
+            "impressions": impressions,
             "links": links,
+            "url_constructed": url_constructed,
         },
     }
+
+
+def normalize_x_reply(raw: dict) -> dict:
+    """把单条回复（扁平或 X API 原样）映射为 comments 条目。
+
+    隐私：评论作者用户名/作者 id 一律不进入 comments，只保留文本、时间、计数。
+    """
+    metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+    api_metrics = raw.get("public_metrics") if isinstance(
+        raw.get("public_metrics"), dict) else {}
+
+    def scalar(value):
+        return None if isinstance(value, (list, dict)) else value
+
+    def value(flat_key: str, api_key: str):
+        for candidate in (metrics.get(flat_key), raw.get(flat_key),
+                          api_metrics.get(api_key)):
+            candidate = scalar(candidate)
+            if candidate is not None:
+                return candidate
+        return 0
+
+    return {
+        "text": (raw.get("text") or "").strip(),
+        "created_at": raw.get("created_at") or "",
+        "metrics": {
+            "likes": value("likes", "like_count"),
+            "reposts": value("reposts", "retweet_count"),
+            "replies": value("replies", "reply_count"),
+            "quotes": value("quotes", "quote_count"),
+        },
+        "parent_id": _x_reply_parent(raw),
+        "lang": raw.get("lang") or "",
+    }
+
+
+def normalize_x_replies(replies: list) -> list[dict]:
+    if not isinstance(replies, list):
+        raise ValueError("replies 应为回复数组（list）")
+    out = []
+    for i, raw in enumerate(replies):
+        if not isinstance(raw, dict):
+            raise ValueError(f"第 {i} 条回复不是对象")
+        out.append(normalize_x_reply(raw))
+    return out
+
+
+def _x_reply_parent(raw: dict) -> str:
+    for key in ("parent_id", "in_reply_to", "in_reply_to_id",
+                "in_reply_to_status_id", "reply_to"):
+        value = raw.get(key)
+        if value:
+            return str(value)
+    refs = raw.get("referenced_tweets") or []
+    if isinstance(refs, list):
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            if ref.get("type") in (None, "replied_to", "reply") and ref.get("id"):
+                return str(ref["id"])
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +467,25 @@ def dedupe(items: list[dict]) -> tuple[list[dict], list[str]]:
     return out, dropped
 
 
+def _has_missing_url_error(errors) -> bool:
+    for err in errors or []:
+        text = str(err)
+        if "缺少 url" in text or "缺少 source_url" in text:
+            return True
+    return False
+
+
 def validate_item(item: dict) -> list[str]:
     """校验素材是否满足 PRD 最小字段与枚举约束，返回错误列表。"""
     errors = []
     for f in REQUIRED_FIELDS:
         if f not in item or item[f] in (None, ""):
+            # X API 原样文件可能无 url；仅当 errors 明确说明缺少 url/source_url
+            # 时豁免，避免任意错误（如缺少作者）掩盖来源缺失。
+            if (f == "source_url" and item.get("source_type") == "x_posts"
+                    and item.get("platform") == "x"
+                    and _has_missing_url_error(item.get("errors"))):
+                continue
             if not (f == "published_at" and item.get("published_at") is None):
                 errors.append(f"缺少必填字段: {f}")
     if item.get("source_type") not in VALID_SOURCE_TYPES:

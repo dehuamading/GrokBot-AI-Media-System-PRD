@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 @dataclass
 class Draft:
     topic_id: str
-    platform: str                 # 抖音 | 小红书
+    platform: str                 # 抖音 | 小红书 | 两者（两者=一份通用稿）
     title: str
     body: str
     fact_checklist: list[str] = field(default_factory=list)
@@ -20,15 +20,25 @@ class Draft:
     unverified_warnings: list[str] = field(default_factory=list)
     engine: str = "template@v1"
     version: int = 1              # PRD 6.1：每题×每平台只有 V1 起点一份，之后修订同一稿
+    draft_id: str = ""            # D-<topic_id>-<platform>-v<version>；写 04 的唯一键
+    titles: list[str] = field(default_factory=list)
+    openings: list[str] = field(default_factory=list)
+    demo_suggestions: list[str] = field(default_factory=list)
 
     def to_text(self) -> str:
         def bullets(items, prefix="-"):
             return [f"{prefix} {x}" for x in items] or [f"{prefix}（无）"]
 
-        parts = [f"【标题】{self.title}", "", self.body, "",
-                 "【事实核对清单】", *bullets(self.fact_checklist),
-                 "【来源链接】", *bullets(self.sources),
-                 "【未证实内容提醒】", *bullets(self.unverified_warnings)]
+        titles = self.titles or [self.title]
+        parts = ["【标题候选】", *bullets(titles, "-"), ""]
+        if self.openings:
+            parts += ["【开头候选】", *bullets(self.openings), ""]
+        parts += ["【完整口播稿】", self.body, ""]
+        if self.demo_suggestions:
+            parts += ["【操作演示建议】", *bullets(self.demo_suggestions), ""]
+        parts += ["【事实核对清单】", *bullets(self.fact_checklist),
+                  "【来源链接】", *bullets(self.sources),
+                  "【未证实内容提醒】", *bullets(self.unverified_warnings)]
         return "\n".join(parts)
 
 

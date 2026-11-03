@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -60,9 +61,9 @@ def test_load_x_posts_errors(tmp_path):
 def test_dedupe_x_posts_by_id_and_url(tmp_path):
     f = tmp_path / "dup.json"
     f.write_text(
-        '[{"id":"1","url":"https://x.com/a/status/1","text":"aa bb cc dd",'
+        '[{"id":"1","url":"https://x.com/example_a/status/1","text":"aa bb cc dd",'
         '"created_at":"2026-10-30T00:00:00Z","author_username":"a"},'
-        '{"id":"1","url":"https://x.com/a/status/1","text":"aa bb cc dd",'
+        '{"id":"1","url":"https://x.com/example_a/status/1","text":"aa bb cc dd",'
         '"created_at":"2026-10-30T00:00:00Z","author_username":"a"}]',
         encoding="utf-8")
     out, dropped = dedupe(load_x_posts(f))
@@ -108,3 +109,177 @@ def test_step_collect_without_x_posts_backward_compatible(tmp_path):
     out = pipeline.step_collect(state, aihot_file=AIHOT, x_following_file=XF,
                                 snapshot_dir=tmp_path / "raw")
     assert len(out["materials"]) == 8 and out["x_posts"] == 0
+
+
+# ---------------------------------------------------------------- X API 原样格式
+def _write_json(tmp_path: Path, name: str, obj) -> Path:
+    p = tmp_path / name
+    p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def test_load_x_posts_x_api_raw_maps_author_and_metrics(tmp_path):
+    """X API 原样格式：data[] + includes.users、author_id、public_metrics。"""
+    payload = {
+        "data": [{
+            "id": "api-1001",
+            "text": "手把手教程：零基础用 AI 做短视频（假数据）",
+            "created_at": "2026-10-30T02:00:00.000Z",
+            "author_id": "u-1",
+            "lang": "zh",
+            "conversation_id": "api-1001",
+            "public_metrics": {
+                "like_count": 11, "retweet_count": 2, "reply_count": 3,
+                "quote_count": 4, "impression_count": 500,
+            },
+            "entities": {
+                "hashtags": [{"tag": "AI"}],
+                "urls": [{"expanded_url": "https://example.com/a"}],
+            },
+        }],
+        "includes": {"users": [
+            {"id": "u-1", "username": "example_api_user", "name": "API示例"},
+        ]},
+    }
+    p = load_x_posts(_write_json(tmp_path, "api.json", payload))[0]
+    assert "(@example_api_user)" in p["author_or_publisher"]
+    assert "API示例" in p["author_or_publisher"]
+    assert p["metrics"] == {"likes": 11, "reposts": 2, "replies": 3,
+                            "quotes": 4, "views": 500}
+    assert p["extra"]["likes"] == 11
+    assert p["extra"]["impressions"] == 500
+    assert p["platform"] == "x"
+    assert p["origin_agent"] == "grokbot"
+    assert p["license_status"] == "公开"
+    assert p["keywords"] == ["AI"]
+    # X API 原样格式：username 与 id 齐备时构造可追溯 URL，并显式标注
+    assert p["source_url"] == "https://x.com/example_api_user/status/api-1001"
+    assert p["extra"]["url_constructed"] is True
+    assert p["errors"] == []
+    assert validate_item(p) == []
+
+
+def test_load_x_posts_with_replies_keeps_text_not_author(tmp_path):
+    """每帖 replies：保留回复原文/计数/父 id，不保留回复作者用户名。"""
+    payload = {"posts": [{
+        "id": "p-1", "url": "https://x.com/example/status/p-1",
+        "author_username": "example", "author_name": "示例",
+        "created_at": "2026-10-30T02:00:00.000Z", "text": "主帖（假数据）",
+        "replies": [
+            {"id": "r-1", "text": "求教程，我也不会（假数据）",
+             "created_at": "2026-10-30T03:00:00.000Z",
+             "author_username": "private_replier", "lang": "zh",
+             "metrics": {"likes": 5, "reposts": 1, "replies": 0, "quotes": 0},
+             "in_reply_to": "p-1"},
+            {"id": "r-2", "text": "国内能用吗？（假数据）",
+             "created_at": "2026-10-30T03:10:00.000Z",
+             "author_username": "private_replier2", "lang": "zh",
+             "public_metrics": {"like_count": 2, "retweet_count": 0,
+                                "reply_count": 0, "quote_count": 0},
+             "referenced_tweets": [{"type": "replied_to", "id": "p-1"}]},
+        ],
+    }]}
+    p = load_x_posts(_write_json(tmp_path, "replies.json", payload))[0]
+    assert len(p["comments"]) == 2
+    assert p["comments"][0]["text"] == "求教程，我也不会（假数据）"
+    assert p["comments"][0]["parent_id"] == "p-1"
+    assert p["comments"][0]["metrics"]["likes"] == 5
+    assert p["comments"][1]["metrics"]["likes"] == 2
+    assert "author_username" not in p["comments"][0]
+    assert "private_replier" not in json.dumps(p["comments"], ensure_ascii=False)
+    assert p["user_problem_evidence"] == ["求教程，我也不会（假数据）",
+                                           "国内能用吗？（假数据）"]
+
+
+def test_top_level_replies_attach_by_conversation_or_parent(tmp_path):
+    payload = {
+        "posts": [
+            {"id": "p-1", "url": "https://x.com/example/status/p-1",
+             "author_username": "a", "created_at": "2026-10-30T02:00:00Z",
+             "text": "帖子一（假数据）", "conversation_id": "conv-1"},
+            {"id": "p-2", "url": "https://x.com/example/status/p-2",
+             "author_username": "b", "created_at": "2026-10-30T02:00:00Z",
+             "text": "帖子二（假数据）"},
+        ],
+        "replies": [
+            {"id": "tr-1", "text": "挂在 p-1 的回复（假数据）",
+             "created_at": "2026-10-30T03:00:00Z", "conversation_id": "conv-1",
+             "public_metrics": {"like_count": 1, "retweet_count": 0,
+                                "reply_count": 0, "quote_count": 0}},
+            {"id": "tr-2", "text": "挂在 p-2 的回复（假数据）",
+             "created_at": "2026-10-30T03:00:00Z", "in_reply_to": "p-2"},
+        ],
+    }
+    posts = load_x_posts(_write_json(tmp_path, "top_replies.json", payload))
+    by_id = {p["item_id"]: p for p in posts}
+    assert by_id["x_posts:p-1"]["comments"][0]["text"].startswith("挂在 p-1")
+    assert by_id["x_posts:p-2"]["comments"][0]["text"].startswith("挂在 p-2")
+
+
+def test_reply_entry_in_posts_does_not_overwrite_root_conversation(tmp_path):
+    payload = {
+        "posts": [
+            {"id": "p-1", "url": "https://x.com/example/status/p-1",
+             "author_username": "root_user",
+             "created_at": "2026-10-30T02:00:00Z",
+             "text": "根帖（假数据）", "conversation_id": "conv-1"},
+            {"id": "p-2", "url": "https://x.com/example/status/p-2",
+             "author_username": "reply_user",
+             "created_at": "2026-10-30T03:00:00Z",
+             "text": "帖内回复条目（假数据）", "conversation_id": "conv-1",
+             "in_reply_to": "p-1"},
+        ],
+        "replies": [
+            {"id": "tr-1", "text": "顶层回复（假数据）",
+             "created_at": "2026-10-30T04:00:00Z", "conversation_id": "conv-1",
+             "author_username": "secret_replier"},
+        ],
+    }
+    posts = load_x_posts(_write_json(tmp_path, "root_guard.json", payload))
+    by_id = {p["item_id"]: p for p in posts}
+    assert by_id["x_posts:p-1"]["comments"][0]["text"] == "顶层回复（假数据）"
+    assert by_id["x_posts:p-2"]["comments"] == []
+    blob = json.dumps(posts, ensure_ascii=False)
+    assert "secret_replier" not in blob
+
+
+def test_orphan_top_level_reply_is_counted_without_usernames(tmp_path):
+    payload = {
+        "posts": [{"id": "p-1", "url": "https://x.com/example/status/p-1",
+                   "author_username": "root_user",
+                   "created_at": "2026-10-30T02:00:00Z",
+                   "text": "根帖（假数据）"}],
+        "replies": [
+            {"id": "tr-1", "text": "孤儿回复一（假数据）",
+             "created_at": "2026-10-30T03:00:00Z",
+             "conversation_id": "orphan-conv",
+             "author_username": "orphan_user_one"},
+            {"id": "tr-2", "text": "孤儿回复二（假数据）",
+             "created_at": "2026-10-30T03:10:00Z",
+             "in_reply_to": "missing-post",
+             "author_username": "orphan_user_two"},
+        ],
+    }
+    posts = load_x_posts(_write_json(tmp_path, "orphans.json", payload))
+    assert posts[0]["comments"] == []
+    assert posts.errors and "2" in posts.errors[0]
+    blob = json.dumps(posts.errors, ensure_ascii=False)
+    assert "orphan_user" not in blob
+
+
+def test_bad_x_api_and_reply_data_raise(tmp_path):
+    with pytest.raises(ValueError):
+        load_x_posts(_write_json(tmp_path, "bad_api.json", {
+            "data": [{"text": "缺 id 和 created_at（假数据）"}],
+            "includes": {"users": []}}))
+    with pytest.raises(ValueError):
+        load_x_posts(_write_json(tmp_path, "bad_replies.json", {
+            "posts": [{"id": "p-1", "url": "https://x.com/example/status/p-1",
+                       "text": "x（假数据）", "created_at": "2026-10-30T02:00:00Z"}],
+            "replies": "not-a-list"}))
+    with pytest.raises(ValueError):
+        load_x_posts(_write_json(tmp_path, "bad_reply_item.json", {
+            "data": [{"id": "p-1", "text": "x（假数据）",
+                      "created_at": "2026-10-30T02:00:00Z", "author_id": "u-1",
+                      "replies": ["not-an-object"]}],
+            "includes": {"users": [{"id": "u-1", "username": "u"}]}}))
